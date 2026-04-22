@@ -1,0 +1,20 @@
+[workspace]
+members = [
+  "crates/sim-core",
+  "crates/sim-proto",
+  "crates/sim-server",
+  "crates/sim-cli",
+  "crates/sim-ui",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+sim-core = { path = "crates/sim-core" }
+sim-proto = { path = "crates/sim-proto" }
+sim-server = { path = "crates/sim-server" }
+sim-ui = { path = "crates/sim-ui" }

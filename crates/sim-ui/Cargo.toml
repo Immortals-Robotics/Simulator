@@ -1,0 +1,17 @@
+[package]
+name = "sim-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "sim-ui"
+path = "src/main.rs"
+required-features = ["runtime"]
+
+[features]
+default = []
+runtime = []
