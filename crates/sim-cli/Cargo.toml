@@ -1,0 +1,15 @@
+[package]
+name = "sim-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sim-core.workspace = true
+sim-proto.workspace = true
+sim-server.workspace = true
+sim-ui = { workspace = true, optional = true }
+
+[features]
+default = []
+ui = ["dep:sim-ui"]
