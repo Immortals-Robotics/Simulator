@@ -43,6 +43,8 @@ struct RunArgs {
     vision_rate_hz: f32,
     #[arg(long)]
     no_vision: bool,
+    #[arg(long)]
+    log_commands: bool,
     #[arg(long, value_enum, default_value_t = RunMode::Realtime)]
     mode: RunMode,
     #[arg(long, default_value_t = 2.0)]
@@ -178,8 +180,8 @@ fn run(args: RunArgs) -> Result<()> {
 
     loop {
         speed = handle_control(&mut control, &mut sim, speed, vision.as_mut())?;
-        handle_robot_control(&mut blue, &mut sim, Team::Blue)?;
-        handle_robot_control(&mut yellow, &mut sim, Team::Yellow)?;
+        handle_robot_control(&mut blue, &mut sim, Team::Blue, args.log_commands)?;
+        handle_robot_control(&mut yellow, &mut sim, Team::Yellow, args.log_commands)?;
 
         match args.mode {
             RunMode::Realtime => {
@@ -253,6 +255,7 @@ fn handle_robot_control(
     endpoint: &mut Endpoint,
     sim_core: &mut Simulator,
     team: Team,
+    log_commands: bool,
 ) -> Result<()> {
     let mut buf = [0_u8; MAX_DATAGRAM_SIZE];
 
@@ -261,7 +264,7 @@ fn handle_robot_control(
             Ok((len, peer)) => {
                 endpoint.last_peer = Some(peer);
                 let response = match sim::RobotControl::decode(&buf[..len]) {
-                    Ok(command) => apply_robot_control(sim_core, team, command),
+                    Ok(command) => apply_robot_control(sim_core, team, command, log_commands),
                     Err(err) => robot_response_with_error("decode.robot_control", err.to_string()),
                 };
                 endpoint.send(peer, &response)?;
@@ -376,6 +379,7 @@ fn apply_robot_control(
     sim_core: &mut Simulator,
     team: Team,
     control: sim::RobotControl,
+    log_commands: bool,
 ) -> sim::RobotControlResponse {
     let errors = Vec::new();
 
@@ -389,6 +393,12 @@ fn apply_robot_control(
             .move_command
             .and_then(|move_command| move_command.command)
             .map(move_command_from_proto);
+        if log_commands {
+            eprintln!(
+                "robot command: team={team:?} id={} movement={movement:?} kick={:?}",
+                command.id, command.kick_speed
+            );
+        }
 
         sim_core.apply_robot_command(RobotCommand {
             id,
@@ -538,5 +548,67 @@ fn error(code: impl Into<String>, message: impl Into<String>) -> sim::SimulatorE
     sim::SimulatorError {
         code: Some(code.into()),
         message: Some(message.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protobuf_robot_control_moves_robot() {
+        let mut sim_core = Simulator::default();
+        let before = sim_core
+            .snapshot()
+            .robots
+            .into_iter()
+            .find(|robot| {
+                robot.id
+                    == RobotId {
+                        team: Team::Blue,
+                        id: 0,
+                    }
+            })
+            .expect("default blue robot 0 should exist");
+
+        let control = sim::RobotControl {
+            robot_commands: vec![sim::RobotCommand {
+                id: 0,
+                move_command: Some(sim::RobotMoveCommand {
+                    command: Some(sim::robot_move_command::Command::GlobalVelocity(
+                        sim::MoveGlobalVelocity {
+                            x: 1.0,
+                            y: 0.0,
+                            angular: 0.0,
+                        },
+                    )),
+                }),
+                kick_speed: None,
+                kick_angle: None,
+                dribbler_speed: None,
+            }],
+        };
+        let mut bytes = Vec::new();
+        control.encode(&mut bytes).expect("encode robot control");
+        let decoded = sim::RobotControl::decode(bytes.as_slice()).expect("decode robot control");
+
+        let response = apply_robot_control(&mut sim_core, Team::Blue, decoded, false);
+        sim_core.step(0.1);
+
+        let after = sim_core
+            .snapshot()
+            .robots
+            .into_iter()
+            .find(|robot| {
+                robot.id
+                    == RobotId {
+                        team: Team::Blue,
+                        id: 0,
+                    }
+            })
+            .expect("default blue robot 0 should exist");
+
+        assert!(response.errors.is_empty());
+        assert!(after.x > before.x + 0.05);
     }
 }

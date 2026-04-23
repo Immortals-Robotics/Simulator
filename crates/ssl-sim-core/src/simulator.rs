@@ -507,4 +507,41 @@ mod tests {
             11
         );
     }
+
+    #[test]
+    fn global_velocity_command_moves_robot() {
+        let mut sim = Simulator::default();
+        let id = RobotId {
+            team: Team::Blue,
+            id: 0,
+        };
+        let before = sim
+            .snapshot()
+            .robots
+            .into_iter()
+            .find(|robot| robot.id == id)
+            .expect("default blue robot 0 should exist");
+
+        sim.apply_robot_command(RobotCommand {
+            id,
+            movement: Some(MoveCommand::GlobalVelocity {
+                x: 1.0,
+                y: 0.0,
+                angular: 0.0,
+            }),
+            kick_speed: None,
+            kick_angle_deg: 0.0,
+            dribbler_speed: None,
+        });
+        sim.step(0.1);
+
+        let after = sim
+            .snapshot()
+            .robots
+            .into_iter()
+            .find(|robot| robot.id == id)
+            .expect("default blue robot 0 should exist");
+
+        assert!(after.x > before.x + 0.05);
+    }
 }
