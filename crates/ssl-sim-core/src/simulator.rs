@@ -51,6 +51,13 @@ impl Default for SimulatorConfig {
 #[derive(Debug, Clone, Copy)]
 struct RobotHandles {
     body: RigidBodyHandle,
+    motion: RobotMotion,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RobotMotion {
+    linear: Vector,
+    angular_z: f32,
 }
 
 pub struct Simulator {
@@ -139,6 +146,7 @@ impl Simulator {
             return;
         }
 
+        self.update_robot_kinematics(dt_seconds);
         self.integration.dt = dt_seconds;
         self.pipeline.step(
             self.gravity,
@@ -217,8 +225,13 @@ impl Simulator {
 
         self.ensure_robot(teleport.id);
         let z = self.config.robot_height * 0.5;
+        let handles = self
+            .robots
+            .get_mut(&teleport.id)
+            .expect("robot handles should exist after ensure_robot");
         let body = self
-            .robot_body_mut(teleport.id)
+            .bodies
+            .get_mut(handles.body)
             .expect("robot rigid body should exist after ensure_robot");
 
         let current = body.translation();
@@ -230,21 +243,16 @@ impl Simulator {
             body.set_rotation(Rotation::from_rotation_z(orientation), true);
         }
 
-        let linvel = body.linvel();
-        body.set_linvel(
-            Vector::new(
-                teleport.vx.unwrap_or(linvel.x),
-                teleport.vy.unwrap_or(linvel.y),
-                0.0,
-            ),
-            true,
+        let linvel = handles.motion.linear;
+        handles.motion.linear = Vector::new(
+            teleport.vx.unwrap_or(linvel.x),
+            teleport.vy.unwrap_or(linvel.y),
+            0.0,
         );
 
-        let angvel = body.angvel();
-        body.set_angvel(
-            Vector::new(0.0, 0.0, teleport.angular.unwrap_or(angvel.z)),
-            true,
-        );
+        handles.motion.angular_z = teleport.angular.unwrap_or(handles.motion.angular_z);
+        body.set_linvel(handles.motion.linear, true);
+        body.set_angvel(Vector::new(0.0, 0.0, handles.motion.angular_z), true);
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -279,7 +287,7 @@ impl Simulator {
             return;
         }
 
-        let body = RigidBodyBuilder::kinematic_velocity_based()
+        let body = RigidBodyBuilder::kinematic_position_based()
             .translation(Vector::new(0.0, 0.0, self.config.robot_height * 0.5))
             .linear_damping(0.0)
             .angular_damping(0.0)
@@ -294,7 +302,13 @@ impl Simulator {
         self.colliders
             .insert_with_parent(collider, body, &mut self.bodies);
 
-        self.robots.insert(id, RobotHandles { body });
+        self.robots.insert(
+            id,
+            RobotHandles {
+                body,
+                motion: RobotMotion::default(),
+            },
+        );
     }
 
     fn spawn_default_robot(&mut self, team: Team, id: u32) {
@@ -367,6 +381,31 @@ impl Simulator {
             body.set_linvel(Vector::new(vx, vy, 0.0), true);
             body.set_angvel(Vector::new(0.0, 0.0, angular), true);
         }
+        if let Some(handles) = self.robots.get_mut(&id) {
+            handles.motion.linear = Vector::new(vx, vy, 0.0);
+            handles.motion.angular_z = angular;
+        }
+    }
+
+    fn update_robot_kinematics(&mut self, dt_seconds: f32) {
+        for handles in self.robots.values_mut() {
+            let body = self
+                .bodies
+                .get_mut(handles.body)
+                .expect("robot rigid body should exist");
+            let translation = body.translation();
+            let next_translation = Vector::new(
+                translation.x + handles.motion.linear.x * dt_seconds,
+                translation.y + handles.motion.linear.y * dt_seconds,
+                self.config.robot_height * 0.5,
+            );
+            let next_rotation = Rotation::from_rotation_z(
+                robot_orientation(body) + handles.motion.angular_z * dt_seconds,
+            );
+
+            body.set_next_kinematic_translation(next_translation);
+            body.set_next_kinematic_rotation(next_rotation);
+        }
     }
 
     fn kick_ball(&mut self, orientation: f32, speed: f32, angle_deg: f32) {
@@ -406,15 +445,16 @@ impl Simulator {
 
     fn robot_state(&self, id: RobotId) -> Option<RobotState> {
         let body = self.robot_body(id)?;
+        let motion = self.robots.get(&id)?.motion;
         Some(RobotState {
             id,
             x: body.translation().x,
             y: body.translation().y,
             z: body.translation().z,
             orientation: robot_orientation(body),
-            vx: body.linvel().x,
-            vy: body.linvel().y,
-            angular: body.angvel().z,
+            vx: motion.linear.x,
+            vy: motion.linear.y,
+            angular: motion.angular_z,
             dribbler_ball_contact: self.robot_has_ball(id),
         })
     }
