@@ -7,9 +7,24 @@ use crate::types::{
     TeleportRobot,
 };
 
+const DEFAULT_ROBOT_FORMATION: [(f32, f32); 11] = [
+    (1.50, 1.12),
+    (1.50, 0.00),
+    (1.50, -1.12),
+    (0.55, 0.00),
+    (2.50, 0.00),
+    (3.60, 0.00),
+    (3.20, 0.75),
+    (3.20, -0.75),
+    (3.20, 1.50),
+    (3.20, -1.50),
+    (3.20, 2.25),
+];
+
 #[derive(Debug, Clone)]
 pub struct SimulatorConfig {
     pub fixed_step_seconds: f32,
+    pub initial_robots_per_team: u32,
     pub ball_radius: f32,
     pub ball_mass: f32,
     pub robot_radius: f32,
@@ -22,6 +37,7 @@ impl Default for SimulatorConfig {
     fn default() -> Self {
         Self {
             fixed_step_seconds: 0.002,
+            initial_robots_per_team: 11,
             ball_radius: 0.0215,
             ball_mass: 0.046,
             robot_radius: 0.09,
@@ -88,7 +104,7 @@ impl Simulator {
         let mut integration = IntegrationParameters::default();
         integration.dt = config.fixed_step_seconds;
 
-        Self {
+        let mut simulator = Self {
             config,
             time_seconds: 0.0,
             frame_number: 0,
@@ -105,7 +121,9 @@ impl Simulator {
             ccd: CCDSolver::new(),
             ball_body,
             robots: HashMap::new(),
-        }
+        };
+        simulator.spawn_default_robots();
+        simulator
     }
 
     pub fn config(&self) -> &SimulatorConfig {
@@ -143,6 +161,18 @@ impl Simulator {
 
     pub fn fixed_step(&mut self) {
         self.step(self.config.fixed_step_seconds);
+    }
+
+    pub fn spawn_default_robots(&mut self) {
+        let robots_per_team = self
+            .config
+            .initial_robots_per_team
+            .min(DEFAULT_ROBOT_FORMATION.len() as u32);
+
+        for id in 0..robots_per_team {
+            self.spawn_default_robot(Team::Blue, id);
+            self.spawn_default_robot(Team::Yellow, id);
+        }
     }
 
     pub fn apply_robot_command(&mut self, command: RobotCommand) {
@@ -265,6 +295,27 @@ impl Simulator {
             .insert_with_parent(collider, body, &mut self.bodies);
 
         self.robots.insert(id, RobotHandles { body });
+    }
+
+    fn spawn_default_robot(&mut self, team: Team, id: u32) {
+        let Some((x, y)) = DEFAULT_ROBOT_FORMATION.get(id as usize).copied() else {
+            return;
+        };
+        let (x, orientation) = match team {
+            Team::Blue => (-x, 0.0),
+            Team::Yellow => (x, std::f32::consts::PI),
+        };
+
+        self.teleport_robot(TeleportRobot {
+            id: RobotId { team, id },
+            present: Some(true),
+            x: Some(x),
+            y: Some(y),
+            orientation: Some(orientation),
+            vx: Some(0.0),
+            vy: Some(0.0),
+            angular: Some(0.0),
+        });
     }
 
     fn remove_robot(&mut self, id: RobotId) {
@@ -432,5 +483,28 @@ mod tests {
         });
 
         assert!(sim.snapshot().ball.velocity.z > 0.0);
+    }
+
+    #[test]
+    fn default_simulator_starts_with_eleven_robots_per_team() {
+        let sim = Simulator::default();
+        let snapshot = sim.snapshot();
+
+        assert_eq!(
+            snapshot
+                .robots
+                .iter()
+                .filter(|robot| robot.id.team == Team::Blue)
+                .count(),
+            11
+        );
+        assert_eq!(
+            snapshot
+                .robots
+                .iter()
+                .filter(|robot| robot.id.team == Team::Yellow)
+                .count(),
+            11
+        );
     }
 }

@@ -51,3 +51,6 @@ currently exposes this as:
 cargo run -p ssl-sim-cli -- run --mode realtime
 cargo run -p ssl-sim-cli -- run --mode fast --step-ms 2
 ```
+
+By default the simulator starts with 11 blue and 11 yellow robots in a symmetric
+in-field formation based on grSim's inside formation.
