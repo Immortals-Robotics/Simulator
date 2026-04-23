@@ -1,7 +1,7 @@
 use std::{
     net::{SocketAddr, UdpSocket},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use prost::Message;
 use rapier3d::prelude::Vector;
 use ssl_sim_core::{
-    MoveCommand, RobotCommand, RobotId, Simulator, SimulatorConfig, Team, TeleportBall,
+    MoveCommand, RobotCommand, RobotId, Simulator, SimulatorConfig, Snapshot, Team, TeleportBall,
     TeleportRobot,
 };
 use ssl_sim_proto::sim;
@@ -37,6 +37,12 @@ struct RunArgs {
     blue_addr: SocketAddr,
     #[arg(long, default_value = "0.0.0.0:10302")]
     yellow_addr: SocketAddr,
+    #[arg(long, default_value = "224.5.23.2:10020")]
+    vision_addr: SocketAddr,
+    #[arg(long, default_value_t = 60.0)]
+    vision_rate_hz: f32,
+    #[arg(long)]
+    no_vision: bool,
     #[arg(long, value_enum, default_value_t = RunMode::Realtime)]
     mode: RunMode,
     #[arg(long, default_value_t = 2.0)]
@@ -78,6 +84,55 @@ impl Endpoint {
     }
 }
 
+struct VisionPublisher {
+    socket: UdpSocket,
+    target: SocketAddr,
+    interval: Duration,
+    last_sent: Instant,
+}
+
+impl VisionPublisher {
+    fn bind(target: SocketAddr, rate_hz: f32) -> Result<Self> {
+        let socket = UdpSocket::bind("0.0.0.0:0").context("bind vision UDP socket")?;
+        socket
+            .set_multicast_loop_v4(true)
+            .context("enable multicast loopback for vision UDP socket")?;
+        Ok(Self {
+            socket,
+            target,
+            interval: Duration::from_secs_f32(1.0 / rate_hz.max(1.0)),
+            last_sent: Instant::now(),
+        })
+    }
+
+    fn set_port(&mut self, port: u16) {
+        self.target.set_port(port);
+    }
+
+    fn maybe_publish(&mut self, snapshot: &Snapshot) -> Result<()> {
+        if self.last_sent.elapsed() < self.interval {
+            return Ok(());
+        }
+
+        self.publish(snapshot)?;
+        self.last_sent = Instant::now();
+        Ok(())
+    }
+
+    fn publish(&self, snapshot: &Snapshot) -> Result<()> {
+        let timestamp = unix_now_seconds();
+        let packet = sim::SslWrapperPacket {
+            detection: Some(detection_from_snapshot(snapshot, timestamp)),
+            geometry: None,
+            source: Some(sim::SslSource::Other as i32),
+        };
+        let mut buf = Vec::with_capacity(packet.encoded_len());
+        packet.encode(&mut buf)?;
+        self.socket.send_to(&buf, self.target)?;
+        Ok(())
+    }
+}
+
 fn main() -> Result<()> {
     match Args::parse().command {
         Command::Run(args) => run(args),
@@ -94,10 +149,23 @@ fn run(args: RunArgs) -> Result<()> {
     let mut control = Endpoint::bind(args.control_addr)?;
     let mut blue = Endpoint::bind(args.blue_addr)?;
     let mut yellow = Endpoint::bind(args.yellow_addr)?;
+    let mut vision = if args.no_vision {
+        None
+    } else {
+        Some(VisionPublisher::bind(
+            args.vision_addr,
+            args.vision_rate_hz,
+        )?)
+    };
 
     eprintln!("simulation control: {}", control.local_addr()?);
     eprintln!("blue robot control: {}", blue.local_addr()?);
     eprintln!("yellow robot control: {}", yellow.local_addr()?);
+    if let Some(vision) = &vision {
+        eprintln!("vision multicast: {}", vision.target);
+    } else {
+        eprintln!("vision multicast: disabled");
+    }
     eprintln!(
         "mode: {:?}, fixed step: {:.4} s",
         args.mode, fixed_step_seconds
@@ -109,7 +177,7 @@ fn run(args: RunArgs) -> Result<()> {
     let mut speed = 1.0_f32;
 
     loop {
-        speed = handle_control(&mut control, &mut sim, speed)?;
+        speed = handle_control(&mut control, &mut sim, speed, vision.as_mut())?;
         handle_robot_control(&mut blue, &mut sim, Team::Blue)?;
         handle_robot_control(&mut yellow, &mut sim, Team::Yellow)?;
 
@@ -129,8 +197,12 @@ fn run(args: RunArgs) -> Result<()> {
             }
         }
 
+        let snapshot = sim.snapshot();
+        if let Some(vision) = &mut vision {
+            vision.maybe_publish(&snapshot)?;
+        }
+
         if last_log.elapsed() >= Duration::from_secs(1) {
-            let snapshot = sim.snapshot();
             eprintln!(
                 "t={:.3}s frame={} ball=({:.3}, {:.3}, {:.3}) robots={}",
                 snapshot.time_seconds,
@@ -145,7 +217,12 @@ fn run(args: RunArgs) -> Result<()> {
     }
 }
 
-fn handle_control(endpoint: &mut Endpoint, sim_core: &mut Simulator, speed: f32) -> Result<f32> {
+fn handle_control(
+    endpoint: &mut Endpoint,
+    sim_core: &mut Simulator,
+    speed: f32,
+    mut vision: Option<&mut VisionPublisher>,
+) -> Result<f32> {
     let mut current_speed = speed;
     let mut buf = [0_u8; MAX_DATAGRAM_SIZE];
 
@@ -154,7 +231,12 @@ fn handle_control(endpoint: &mut Endpoint, sim_core: &mut Simulator, speed: f32)
             Ok((len, peer)) => {
                 endpoint.last_peer = Some(peer);
                 let response = match sim::SimulatorCommand::decode(&buf[..len]) {
-                    Ok(command) => apply_simulator_command(sim_core, command, &mut current_speed),
+                    Ok(command) => apply_simulator_command(
+                        sim_core,
+                        command,
+                        &mut current_speed,
+                        vision.as_deref_mut(),
+                    ),
                     Err(err) => response_with_error("decode.simulator_command", err.to_string()),
                 };
                 endpoint.send(peer, &response)?;
@@ -196,6 +278,7 @@ fn apply_simulator_command(
     sim_core: &mut Simulator,
     command: sim::SimulatorCommand,
     speed: &mut f32,
+    mut vision: Option<&mut VisionPublisher>,
 ) -> sim::SimulatorResponse {
     let mut errors = Vec::new();
 
@@ -218,11 +301,18 @@ fn apply_simulator_command(
                 "custom realism config is not supported yet",
             ));
         }
-        if config.vision_port.is_some() {
-            errors.push(error(
-                "config.vision_port.unsupported",
-                "vision publishing is not implemented yet",
-            ));
+        if let Some(vision_port) = config.vision_port {
+            match (u16::try_from(vision_port), vision.as_deref_mut()) {
+                (Ok(port), Some(vision)) => vision.set_port(port),
+                (Ok(_), None) => errors.push(error(
+                    "config.vision_port.disabled",
+                    "vision publishing is disabled",
+                )),
+                (Err(_), _) => errors.push(error(
+                    "config.vision_port.invalid",
+                    "vision port must fit into a u16",
+                )),
+            }
         }
     }
 
@@ -322,6 +412,58 @@ fn apply_robot_control(
         .collect();
 
     sim::RobotControlResponse { errors, feedback }
+}
+
+fn detection_from_snapshot(snapshot: &Snapshot, timestamp: f64) -> sim::SslDetectionFrame {
+    let mut robots_blue = Vec::new();
+    let mut robots_yellow = Vec::new();
+
+    for robot in &snapshot.robots {
+        let detected = sim::SslDetectionRobot {
+            confidence: 1.0,
+            robot_id: Some(robot.id.id),
+            x: meters_to_millimeters(robot.x),
+            y: meters_to_millimeters(robot.y),
+            orientation: Some(robot.orientation),
+            pixel_x: 0.0,
+            pixel_y: 0.0,
+            height: Some(meters_to_millimeters(robot.z * 2.0)),
+        };
+
+        match robot.id.team {
+            Team::Blue => robots_blue.push(detected),
+            Team::Yellow => robots_yellow.push(detected),
+        }
+    }
+
+    sim::SslDetectionFrame {
+        frame_number: u32::try_from(snapshot.frame_number).unwrap_or(u32::MAX),
+        t_capture: timestamp,
+        t_sent: timestamp,
+        camera_id: 0,
+        balls: vec![sim::SslDetectionBall {
+            confidence: 1.0,
+            area: None,
+            x: meters_to_millimeters(snapshot.ball.position.x),
+            y: meters_to_millimeters(snapshot.ball.position.y),
+            z: Some(meters_to_millimeters(snapshot.ball.position.z)),
+            pixel_x: 0.0,
+            pixel_y: 0.0,
+        }],
+        robots_yellow,
+        robots_blue,
+    }
+}
+
+fn meters_to_millimeters(value: f32) -> f32 {
+    value * 1000.0
+}
+
+fn unix_now_seconds() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
 }
 
 fn move_command_from_proto(command: sim::robot_move_command::Command) -> MoveCommand {

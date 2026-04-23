@@ -16,6 +16,7 @@ fn main() -> Result<()> {
         "ssl_gc_common.proto",
         "ssl_vision_geometry.proto",
         "ssl_vision_detection.proto",
+        "ssl_vision_wrapper.proto",
         "ssl_simulation_error.proto",
         "ssl_simulation_robot_control.proto",
         "ssl_simulation_robot_feedback.proto",

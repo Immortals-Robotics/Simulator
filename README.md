@@ -42,6 +42,7 @@ Default UDP endpoints:
 - simulation control: `0.0.0.0:10300`
 - blue robot control: `0.0.0.0:10301`
 - yellow robot control: `0.0.0.0:10302`
+- vision multicast output: `224.5.23.2:10020`
 
 The core supports both wall-clock stepping and fixed-step fast-forward. The CLI
 currently exposes this as:
