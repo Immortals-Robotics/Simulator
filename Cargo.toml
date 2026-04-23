@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "crates/ssl-sim-core",
+    "crates/ssl-sim-proto",
+    "crates/ssl-sim-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/immortals-ssl-sim"
+
+[workspace.dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+prost = "0.14"
+prost-build = "0.14"
+rapier3d = { version = "0.32", features = ["enhanced-determinism"] }
+thiserror = "2.0"
