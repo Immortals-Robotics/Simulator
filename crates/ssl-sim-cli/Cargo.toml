@@ -11,7 +11,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-prost.workspace = true
-rapier3d.workspace = true
+serde.workspace = true
 ssl-sim-core = { path = "../ssl-sim-core" }
-ssl-sim-proto = { path = "../ssl-sim-proto" }
+ssl-sim-net = { path = "../ssl-sim-net" }
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

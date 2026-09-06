@@ -2,19 +2,45 @@
 members = [
     "crates/ssl-sim-core",
     "crates/ssl-sim-proto",
+    "crates/ssl-sim-net",
     "crates/ssl-sim-cli",
+    "crates/ssl-sim-viewer",
 ]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://example.invalid/immortals-ssl-sim"
+repository = "https://github.com/immortals-ssl/simulator"
 
 [workspace.dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+crossbeam-channel = "0.5"
+eframe = { version = "0.36", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+egui = "0.36"
+glam = { version = "0.30", features = ["serde"] }
 prost = "0.14"
 prost-build = "0.14"
-rapier3d = { version = "0.32", features = ["enhanced-determinism"] }
+prost-types = "0.14"
+rand = "0.9"
+rand_xoshiro = "0.7"
+serde = { version = "1.0", features = ["derive"] }
+socket2 = "0.6"
 thiserror = "2.0"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 4
+
+[profile.bench]
+inherits = "release"

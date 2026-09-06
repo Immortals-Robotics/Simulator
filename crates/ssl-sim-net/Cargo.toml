@@ -1,0 +1,16 @@
+[package]
+name = "ssl-sim-net"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Protocol adapters and UDP endpoints for the Immortals SSL simulator"
+
+[dependencies]
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+ssl-sim-core = { path = "../ssl-sim-core" }
+ssl-sim-proto = { path = "../ssl-sim-proto" }
+thiserror.workspace = true
+tracing.workspace = true

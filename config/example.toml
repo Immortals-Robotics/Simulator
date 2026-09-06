@@ -1,0 +1,249 @@
+# ssl-sim example configuration — every value here is the built-in default.
+#
+#   ssl-sim run --config config/example.toml
+#
+# The file deserialises into `ssl_sim_core::params::SimConfig`. Every table and
+# every key is optional (`#[serde(default)]` throughout), so a config that only
+# overrides `[realism]` is perfectly valid. Command-line flags win over the
+# file: --robots, --step-ms, --seed and --realism all override what is here.
+#
+# Regenerate a fresh copy of this file at any time with `ssl-sim presets`.
+#
+# Units are SI: metres, seconds, radians, kilograms. The wire protocols use
+# millimetres and nanoseconds; that conversion happens in `ssl-sim-net` only.
+
+# Physics substep [s]. 1 ms is the design point; --step-ms overrides it.
+substep = 0.001
+# Seed for every random stream. Same seed + same inputs => identical output.
+# `--seed random` derives one from the wall clock instead.
+seed = 0
+# Seconds without a robot command before a robot coasts to a stop, like real
+# firmware standby.
+command_timeout = 0.1
+# Height of the boundary boards [m]; a chip above this leaves the field.
+wall_height = 0.1
+# Robots placed per team at start (0..=16); --robots overrides it.
+initial_robots_per_team = 11
+
+# --------------------------------------------------------------------------
+# Ball. These constants are simulated *and* advertised verbatim in the
+# geometry packet's SSL_BallModelStraightTwoPhase / SSL_BallModelChipFixedLoss,
+# so a client's prediction model matches the simulation exactly.
+# --------------------------------------------------------------------------
+[ball]
+radius = 0.0215
+mass = 0.046
+# Sliding deceleration [m/s^2], negative.
+acc_slide = -3.0
+# Rolling deceleration [m/s^2], negative.
+acc_roll = -0.3
+# Inertia distribution p = I/(m r^2); the advertised k_switch is 1/(1+p).
+inertia_distribution = 0.5
+# Chip bounce damping (TIGERs field measurements).
+chip_damping_xy_first_hop = 0.75
+chip_damping_xy_other_hops = 0.95
+chip_damping_z = 0.5
+# Below this apex height [m] the ball is grounded.
+min_hop_height = 0.01
+# Below this speed [m/s] the ball snaps to rest.
+rest_speed = 0.01
+
+# --------------------------------------------------------------------------
+# Contact model. `*_normal` is a damping factor: 1 = perfectly inelastic,
+# 0 = perfectly elastic (Sumatra convention). `*_tangent` blends the ball's
+# tangential velocity toward the surface velocity of what it hit.
+# --------------------------------------------------------------------------
+[contact]
+ball_robot_normal = 0.5
+ball_robot_tangent = 0.0
+ball_kicker_normal = 0.6
+ball_kicker_tangent = 0.3
+ball_wall_normal = 0.5
+ball_wall_tangent = 0.0
+spin_retention = 0.6
+robot_robot_restitution = 0.2
+robot_robot_friction = 0.1
+robot_wall_restitution = 0.1
+
+# --------------------------------------------------------------------------
+# Default robot specs per team. Live `RobotSpecs` messages on the control port
+# override individual fields at runtime; anything not on the wire keeps the
+# value configured here.
+# --------------------------------------------------------------------------
+[blue_specs]
+radius = 0.09
+height = 0.15
+mass = 2.5
+# Distance centre -> kicker face [m]; defines the flat front chord and the
+# mouth half-angle acos(center_to_dribbler / radius).
+center_to_dribbler = 0.075
+dribbler_width = 0.07
+# Ball centre distance from the robot centre when seated on the dribbler [m].
+shoot_radius = 0.067
+# inertia_z is optional; omitted means 0.5 * mass * radius^2.
+
+[blue_specs.limits]
+acc_speedup_absolute_max = 4.0
+acc_speedup_angular_max = 50.0
+acc_brake_absolute_max = 6.0
+acc_brake_angular_max = 50.0
+vel_absolute_max = 3.5
+vel_angular_max = 20.0
+
+# Wheel mounting angles [rad], CCW from robot +x, in the protocol order
+# (front_right, back_right, back_left, front_left). These are grSim's
+# 60/135/225/300 degree layout expressed CCW. The `RobotWheelAngles` message is
+# documented *clockwise*, so ssl-sim-net negates on the way in and out.
+[blue_specs.wheel_angles]
+front_right = -1.0471975511965976   # -60 deg
+back_right = -2.356194490192345     # -135 deg
+back_left = 2.356194490192345       # +135 deg
+front_left = 1.0471975511965976     # +60 deg
+
+[blue_specs.drive]
+# "wheels" = four omni wheels with motor force and traction limits;
+# "ideal" = integrate the firmware-limited setpoint directly (fast CI, grSim-like).
+model = "wheels"
+wheel_radius = 0.027
+wheel_mount_radius = 0.0875
+max_wheel_speed = 5.0
+max_wheel_force = 6.0
+velocity_gain = 60.0
+mu_drive = 0.8
+mu_lateral = 0.05
+coast_decel = 8.0
+coast_angular_decel = 50.0
+
+[blue_specs.kicker]
+max_linear_speed = 6.5
+max_chip_speed = 5.5
+min_speed = 0.05
+# Recharge time [s]; a realistic tournament robot is nearer 1-2 s.
+charge_time = 0.1
+max_ball_height = 0.05
+incoming_damping = 1.0
+
+[blue_specs.dribbler]
+# rpm at which the holding force is maximal; commands are normalised by this.
+max_speed_rpm = 10000.0
+hold_accel = 4.0
+roller_radius = 0.007
+seat_depth = 0.008
+# true = perfect "glue" mode. The RC2021 realism preset turns this on via
+# simulate_dribbling = false.
+glue = false
+
+[yellow_specs]
+radius = 0.09
+height = 0.15
+mass = 2.5
+center_to_dribbler = 0.075
+dribbler_width = 0.07
+shoot_radius = 0.067
+
+[yellow_specs.limits]
+acc_speedup_absolute_max = 4.0
+acc_speedup_angular_max = 50.0
+acc_brake_absolute_max = 6.0
+acc_brake_angular_max = 50.0
+vel_absolute_max = 3.5
+vel_angular_max = 20.0
+
+[yellow_specs.wheel_angles]
+front_right = -1.0471975511965976
+back_right = -2.356194490192345
+back_left = 2.356194490192345
+front_left = 1.0471975511965976
+
+[yellow_specs.drive]
+model = "wheels"
+wheel_radius = 0.027
+wheel_mount_radius = 0.0875
+max_wheel_speed = 5.0
+max_wheel_force = 6.0
+velocity_gain = 60.0
+mu_drive = 0.8
+mu_lateral = 0.05
+coast_decel = 8.0
+coast_angular_decel = 50.0
+
+[yellow_specs.kicker]
+max_linear_speed = 6.5
+max_chip_speed = 5.5
+min_speed = 0.05
+charge_time = 0.1
+max_ball_height = 0.05
+incoming_damping = 1.0
+
+[yellow_specs.dribbler]
+max_speed_rpm = 10000.0
+hold_accel = 4.0
+roller_radius = 0.007
+seat_depth = 0.008
+glue = false
+
+# --------------------------------------------------------------------------
+# Vision geometry. Noise and dropouts live in [realism]; this table is the
+# camera rig itself.
+# --------------------------------------------------------------------------
+[vision]
+# Explicit cameras override the auto-placement. Each entry is
+#   [[vision.cameras]]
+#   id = 0
+#   position = [-3.0, -2.25, 4.0]
+cameras = []
+# Cameras to auto-place when `cameras` is empty: 4 (quadrants), 2 or 1.
+default_camera_count = 4
+default_camera_height = 4.0
+# Detection frame rate [Hz] for all cameras.
+frame_rate = 60.0
+# Attach the geometry packet to camera 0 every N frames (1 = every frame).
+geometry_every_n_frames = 30
+# Report the true ball height in SSL_DetectionBall.z. Real vision does not, so
+# this is off; the ball is reported at its floor projection instead.
+report_ball_z = false
+# Added to reported timestamps [s] so they look like Unix time to tools that
+# insist on it. 0 keeps timestamps as plain simulation seconds.
+timestamp_epoch_offset = 0.0
+# Pinhole focal length [px] used for the ball `area` model (ER-Force's 390).
+focal_length_px = 390.0
+
+# --------------------------------------------------------------------------
+# Realism. This is the "realistic" preset; `--realism none|friendly|realistic|
+# rc2021` swaps the whole table, and `--realism <file.toml>` loads a file with
+# exactly these keys at the top level. It is also settable at runtime through
+# `RealismConfig.custom` carrying an ER-Force `RealismConfigErForce`.
+# --------------------------------------------------------------------------
+[realism]
+# Gaussian measurement noise.
+stddev_ball_p = 0.0014      # [m]
+stddev_robot_p = 0.0013     # [m]
+stddev_robot_phi = 0.01     # [rad]
+stddev_ball_area = 6.5      # [px]
+# Ball occlusion behind robots, and the visible fraction below which the ball
+# is dropped for that camera.
+enable_invisible_ball = true
+ball_visibility_threshold = 0.4
+# Half of the camera overlap band [m]: regions overlap by 2 * this.
+camera_overlap = 1.0
+# Spurious ball detections at robot dribblers [1/s/robot] (red break beams).
+dribbler_ball_detections = 0.05
+# Error injected into the *reported* camera calibration only [m]; the true
+# camera positions used for the ball projection stay correct.
+camera_position_error = 0.1
+# Datagram loss on the robot control ports (applied in ssl-sim-net).
+robot_command_loss = 0.03
+robot_response_loss = 0.1
+# Per-camera, per-frame dropout probabilities.
+missing_ball_detections = 0.05
+missing_robot_detections = 0.02
+# Capture -> send delay [s] and t_sent - t_capture [s].
+vision_delay = 0.035
+vision_processing_time = 0.01
+# false switches the dribbler to perfect "glue" mode.
+simulate_dribbling = true
+# Fixed per-camera radial bias applied to every reported object [m].
+object_position_offset = 0.02
+# Fixed delay on incoming robot commands [s]. NOT IMPLEMENTED YET: the net
+# layer applies commands at the next substep regardless of this value.
+command_delay = 0.0
