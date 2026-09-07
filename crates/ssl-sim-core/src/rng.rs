@@ -17,6 +17,10 @@ pub struct Rngs {
     pub packet_loss: Xoshiro256PlusPlus,
     /// Ordering shuffles (multiple balls in one frame).
     pub shuffle: Xoshiro256PlusPlus,
+    /// Physics imperfections: kick direction/speed error, per-robot dribbler draws.
+    pub physics: Xoshiro256PlusPlus,
+    /// Static per-camera calibration warps and phases (drawn once per camera rig).
+    pub calibration: Xoshiro256PlusPlus,
 }
 
 impl Rngs {
@@ -36,6 +40,8 @@ impl Rngs {
             vision_dropout: mk(2),
             packet_loss: mk(3),
             shuffle: mk(4),
+            physics: mk(5),
+            calibration: mk(6),
         }
     }
 }
@@ -64,6 +70,21 @@ pub fn normal_vec2<R: Rng>(rng: &mut R, stddev: f64) -> crate::types::Vec2 {
     let x = normal(rng, stddev);
     let y = normal(rng, stddev);
     crate::types::Vec2::new(x, y)
+}
+
+/// Draw a uniform sample from `[lo, hi)`. Returns `lo` for an empty or
+/// degenerate range, and consumes exactly one uniform per call.
+pub fn uniform<R: Rng>(rng: &mut R, lo: f64, hi: f64) -> f64 {
+    if lo.is_nan() || hi.is_nan() || hi <= lo {
+        return lo;
+    }
+    lo + rng.random::<f64>() * (hi - lo)
+}
+
+/// Draw a unit vector with a uniformly distributed direction.
+pub fn unit_vec2<R: Rng>(rng: &mut R) -> crate::types::Vec2 {
+    let a = uniform(rng, 0.0, std::f64::consts::TAU);
+    crate::types::Vec2::new(a.cos(), a.sin())
 }
 
 /// Bernoulli trial with probability `p` (clamped to 0..=1).
@@ -149,6 +170,26 @@ mod tests {
         let mut r = Rngs::from_seed(1);
         assert!(!chance(&mut r.vision_dropout, 0.0));
         assert!(chance(&mut r.vision_dropout, 1.0));
+    }
+
+    #[test]
+    fn rng_uniform_stays_in_range() {
+        let mut r = Rngs::from_seed(9);
+        for _ in 0..1000 {
+            let x = uniform(&mut r.calibration, -2.0, 5.0);
+            assert!((-2.0..5.0).contains(&x), "{x} out of range");
+        }
+        // Degenerate ranges return the lower bound instead of panicking.
+        assert_eq!(uniform(&mut r.calibration, 1.0, 1.0), 1.0);
+        assert_eq!(uniform(&mut r.calibration, 2.0, 1.0), 2.0);
+        // Unit vectors are unit length and spread over the circle.
+        let mut sum = crate::types::Vec2::ZERO;
+        for _ in 0..2000 {
+            let v = unit_vec2(&mut r.calibration);
+            assert!((v.length() - 1.0).abs() < 1e-12);
+            sum += v;
+        }
+        assert!((sum / 2000.0).length() < 0.1, "direction is not biased");
     }
 
     #[test]

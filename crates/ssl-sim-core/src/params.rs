@@ -16,8 +16,14 @@ pub struct BallParams {
     pub mass: f64,
     /// Sliding deceleration [m/s^2] (negative).
     pub acc_slide: f64,
-    /// Rolling deceleration [m/s^2] (negative).
+    /// Rolling deceleration at zero speed [m/s^2] (negative).
     pub acc_roll: f64,
+    /// Extra rolling deceleration per m/s of speed [1/s], >= 0. The rolling
+    /// deceleration is `acc_roll - roll_speed_coefficient * v` (closed form kept).
+    pub roll_speed_coefficient: f64,
+    /// Speed [m/s] at which the geometry packet advertises `acc_roll` for clients
+    /// that assume a constant.
+    pub advertise_roll_speed: f64,
     /// Inertia distribution p = I / (m r^2); 0.4 solid sphere, 0.66 hollow.
     /// The published `k_switch` is `1 / (1 + p)`.
     pub inertia_distribution: f64,
@@ -25,8 +31,10 @@ pub struct BallParams {
     pub chip_damping_xy_first_hop: f64,
     /// Horizontal velocity factor kept on later bounces.
     pub chip_damping_xy_other_hops: f64,
-    /// Vertical velocity factor kept on every bounce.
+    /// Vertical velocity factor kept on the first bounce of a chip.
     pub chip_damping_z: f64,
+    /// Vertical velocity factor kept on later bounces.
+    pub chip_damping_z_other_hops: f64,
     /// Below this apex height [m] the ball is considered grounded.
     pub min_hop_height: f64,
     /// Below this speed [m/s] the ball snaps to rest.
@@ -38,6 +46,70 @@ impl BallParams {
     pub fn k_switch(&self) -> f64 {
         1.0 / (1.0 + self.inertia_distribution)
     }
+
+    /// Rolling deceleration [m/s^2] at speed `v` (negative).
+    pub fn acc_roll_at(&self, v: f64) -> f64 {
+        self.acc_roll - self.roll_speed_coefficient.max(0.0) * v.abs()
+    }
+
+    /// Rolling deceleration advertised in the geometry packet.
+    pub fn advertised_acc_roll(&self) -> f64 {
+        self.acc_roll_at(self.advertise_roll_speed)
+    }
+
+    /// Named presets: `default` (pooled 2026 fit), `go26` (German Open 2026
+    /// carpet), `rc26` (RoboCup 2026 carpet), `erforce`, `tigers` (values those
+    /// simulators advertise), `grsim`.
+    pub fn preset(name: &str) -> Option<Self> {
+        let d = Self::default();
+        Some(match name.to_ascii_lowercase().as_str() {
+            "default" | "measured" => d,
+            "go26" => Self {
+                acc_roll: -0.19,
+                acc_slide: -3.42,
+                chip_damping_xy_first_hop: 0.73,
+                ..d
+            },
+            "rc26" => Self {
+                acc_roll: -0.26,
+                acc_slide: -3.10,
+                chip_damping_xy_first_hop: 0.67,
+                ..d
+            },
+            "erforce" => Self {
+                acc_roll: -0.35,
+                roll_speed_coefficient: 0.0,
+                acc_slide: -3.9,
+                inertia_distribution: 1.0 / 0.69 - 1.0,
+                chip_damping_xy_first_hop: 0.715,
+                chip_damping_xy_other_hops: 1.0,
+                chip_damping_z: 0.566,
+                chip_damping_z_other_hops: 0.566,
+                ..d
+            },
+            "tigers" => Self {
+                acc_roll: -0.26,
+                roll_speed_coefficient: 0.0,
+                acc_slide: -3.0,
+                chip_damping_xy_first_hop: 0.75,
+                chip_damping_xy_other_hops: 0.95,
+                chip_damping_z: 0.5,
+                chip_damping_z_other_hops: 0.5,
+                ..d
+            },
+            "grsim" => Self {
+                acc_roll: -0.49,
+                roll_speed_coefficient: 0.0,
+                acc_slide: -0.49,
+                chip_damping_xy_first_hop: 0.6,
+                chip_damping_xy_other_hops: 0.96,
+                chip_damping_z: 0.42,
+                chip_damping_z_other_hops: 0.42,
+                ..d
+            },
+            _ => return None,
+        })
+    }
 }
 
 impl Default for BallParams {
@@ -45,12 +117,15 @@ impl Default for BallParams {
         Self {
             radius: 0.0215,
             mass: 0.046,
-            acc_slide: -3.0,
-            acc_roll: -0.30,
+            acc_slide: -3.3,
+            acc_roll: -0.22,
+            roll_speed_coefficient: 0.045,
+            advertise_roll_speed: 1.5,
             inertia_distribution: 0.5,
-            chip_damping_xy_first_hop: 0.75,
-            chip_damping_xy_other_hops: 0.95,
-            chip_damping_z: 0.50,
+            chip_damping_xy_first_hop: 0.70,
+            chip_damping_xy_other_hops: 0.87,
+            chip_damping_z: 0.46,
+            chip_damping_z_other_hops: 0.40,
             min_hop_height: 0.01,
             rest_speed: 0.01,
         }
@@ -82,21 +157,30 @@ pub struct ContactParams {
     pub robot_robot_friction: f64,
     /// Robot vs boundary restitution.
     pub robot_wall_restitution: f64,
+    /// Ball landing on a robot's flat top: vertical damping (1 = inelastic).
+    pub ball_robot_top_normal: f64,
+    /// Ball landing on a robot's flat top: horizontal blend toward the robot's surface velocity.
+    pub ball_robot_top_tangent: f64,
+    /// Use the flat front chord in robot-robot contacts (false = discs only).
+    pub robot_hull_chord_contacts: bool,
 }
 
 impl Default for ContactParams {
     fn default() -> Self {
         Self {
             ball_robot_normal: 0.5,
-            ball_robot_tangent: 0.0,
-            ball_kicker_normal: 0.6,
-            ball_kicker_tangent: 0.3,
+            ball_robot_tangent: 0.3,
+            ball_kicker_normal: 0.8,
+            ball_kicker_tangent: 0.4,
             ball_wall_normal: 0.5,
             ball_wall_tangent: 0.0,
             spin_retention: 0.6,
             robot_robot_restitution: 0.2,
             robot_robot_friction: 0.1,
             robot_wall_restitution: 0.1,
+            ball_robot_top_normal: 0.54,
+            ball_robot_top_tangent: 0.3,
+            robot_hull_chord_contacts: true,
         }
     }
 }
@@ -122,13 +206,65 @@ pub struct RobotLimits {
 impl Default for RobotLimits {
     fn default() -> Self {
         Self {
-            acc_speedup_absolute_max: 4.0,
-            acc_speedup_angular_max: 50.0,
-            acc_brake_absolute_max: 6.0,
-            acc_brake_angular_max: 50.0,
-            vel_absolute_max: 3.5,
-            vel_angular_max: 20.0,
+            acc_speedup_absolute_max: 3.5,
+            acc_speedup_angular_max: 40.0,
+            acc_brake_absolute_max: 5.0,
+            acc_brake_angular_max: 40.0,
+            vel_absolute_max: 3.0,
+            vel_angular_max: 12.0,
         }
+    }
+}
+
+impl RobotLimits {
+    /// Named presets fitted from 2026 game logs: `default`, `tigers`,
+    /// `erforce`, `kiks`, `fast` (upper envelope), `grsim` (grSim's limits).
+    pub fn preset(name: &str) -> Option<Self> {
+        let d = Self::default();
+        Some(match name.to_ascii_lowercase().as_str() {
+            "default" | "measured" => d,
+            "tigers" => Self {
+                acc_speedup_absolute_max: 3.2,
+                acc_brake_absolute_max: 4.2,
+                vel_absolute_max: 3.3,
+                acc_speedup_angular_max: 45.0,
+                acc_brake_angular_max: 45.0,
+                ..d
+            },
+            "erforce" => Self {
+                acc_speedup_absolute_max: 3.7,
+                acc_brake_absolute_max: 5.5,
+                vel_absolute_max: 3.0,
+                acc_speedup_angular_max: 45.0,
+                acc_brake_angular_max: 45.0,
+                ..d
+            },
+            "kiks" => Self {
+                acc_speedup_absolute_max: 4.2,
+                acc_brake_absolute_max: 5.5,
+                vel_absolute_max: 3.4,
+                acc_speedup_angular_max: 45.0,
+                acc_brake_angular_max: 45.0,
+                ..d
+            },
+            "fast" => Self {
+                acc_speedup_absolute_max: 4.5,
+                acc_brake_absolute_max: 6.0,
+                vel_absolute_max: 3.5,
+                acc_speedup_angular_max: 50.0,
+                acc_brake_angular_max: 50.0,
+                vel_angular_max: 15.0,
+            },
+            "grsim" => Self {
+                acc_speedup_absolute_max: 4.0,
+                acc_brake_absolute_max: 4.0,
+                vel_absolute_max: 5.0,
+                acc_speedup_angular_max: 50.0,
+                acc_brake_angular_max: 50.0,
+                vel_angular_max: 20.0,
+            },
+            _ => return None,
+        })
     }
 }
 
@@ -261,8 +397,13 @@ impl Default for KickerParams {
 pub struct DribblerParams {
     /// Speed [rpm] at which the holding force is at its maximum.
     pub max_speed_rpm: f64,
-    /// Max acceleration [m/s^2] the dribbler can impart to the ball at full speed.
+    /// Mean max acceleration [m/s^2] the dribbler can impart to the ball at full speed.
     pub hold_accel: f64,
+    /// Per-robot spread of `hold_accel` [m/s^2]; each robot draws its own value
+    /// from N(hold_accel, hold_accel_stddev) with the seeded physics stream (0 = identical robots).
+    pub hold_accel_stddev: f64,
+    /// Lower clamp for the per-robot draw [m/s^2].
+    pub hold_accel_min: f64,
     /// Roller radius [m], used for the back-spin imparted to the ball.
     pub roller_radius: f64,
     /// Depth [m] behind the kicker face where the ball is pulled to (seated point).
@@ -275,9 +416,11 @@ impl Default for DribblerParams {
     fn default() -> Self {
         Self {
             max_speed_rpm: 10_000.0,
-            hold_accel: 4.0,
+            hold_accel: 3.0,
+            hold_accel_stddev: 1.0,
+            hold_accel_min: 1.5,
             roller_radius: 0.007,
-            seat_depth: 0.008,
+            seat_depth: 0.0,
             glue: false,
         }
     }
@@ -303,6 +446,7 @@ pub struct RobotSpecs {
     /// Ball centre distance from robot centre when seated on the dribbler [m].
     /// Must be >= center_to_dribbler + ball radius - dribbler.seat_depth so the
     /// seated ball sits in front of the kicker face (the hull chord is solid).
+    /// Measured 0.097-0.099 m in 2026 games (ball touching the face plane).
     pub shoot_radius: f64,
     /// Firmware limits.
     pub limits: RobotLimits,
@@ -317,6 +461,14 @@ pub struct RobotSpecs {
 }
 
 impl RobotSpecs {
+    /// Default specs with a named `RobotLimits` preset applied.
+    pub fn with_limits_preset(name: &str) -> Option<Self> {
+        RobotLimits::preset(name).map(|limits| Self {
+            limits,
+            ..Self::default()
+        })
+    }
+
     /// Effective yaw inertia.
     pub fn inertia(&self) -> f64 {
         self.inertia_z
@@ -347,7 +499,7 @@ impl Default for RobotSpecs {
             inertia_z: None,
             center_to_dribbler: 0.075,
             dribbler_width: 0.07,
-            shoot_radius: 0.0885,
+            shoot_radius: 0.0965,
             limits: RobotLimits::default(),
             wheel_angles: WheelAngles::default(),
             drive: DriveParams::default(),
@@ -355,6 +507,25 @@ impl Default for RobotSpecs {
             dribbler: DribblerParams::default(),
         }
     }
+}
+
+/// Relationship between the capture instants of the cameras.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CameraPhase {
+    /// Hardware-triggered: all cameras capture at fixed offsets from a common clock.
+    Locked,
+    /// Free-running: each camera's phase is a uniformly random constant drawn from the seed.
+    FreeRunning,
+}
+
+/// A scripted vision outage.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct VisionOutage {
+    /// Start [s] of sim time.
+    pub start: f64,
+    /// Duration [s].
+    pub duration: f64,
 }
 
 /// One simulated camera.
@@ -376,6 +547,36 @@ pub struct VisionConfig {
     pub default_camera_count: u32,
     /// Camera height used for auto-placement [m].
     pub default_camera_height: f64,
+    /// Auto-placed camera x as a fraction of the field length (2-camera rigs
+    /// measured at +-0.20 L; the classic assumption is 0.25).
+    pub default_camera_x_fraction: f64,
+    /// Radius [m] around each camera's nadir beyond which it detects nothing
+    /// (hard field-of-view edge); 0 = unlimited.
+    pub fov_radius: f64,
+    /// How the cameras' capture instants relate.
+    pub camera_phase: CameraPhase,
+    /// Per-camera capture offsets [s] within the frame period (used by `Locked`); missing = 0.
+    pub phase_offsets: Vec<f64>,
+    /// Emit `SSL_DetectionBall.area` (a whole tournament ran without it).
+    pub report_area: bool,
+    /// Blob area [px] of a ball on the floor near the nadir; the area model scales this.
+    pub area_at_nadir_px: f64,
+    /// Area [px] reported for spurious dribbler-LED balls.
+    pub spurious_ball_area_px: f64,
+    /// Spurious dribbler balls sit on the robot centreline this far ahead of the centre [m].
+    pub spurious_ball_forward: f64,
+    /// Lateral spread of spurious dribbler balls [m].
+    pub spurious_ball_lateral_stddev: f64,
+    /// Mean reported robot confidence.
+    pub robot_confidence_mean: f64,
+    /// Mean reported ball confidence.
+    pub ball_confidence_mean: f64,
+    /// Spread of reported confidences (clamped to 0..1).
+    pub confidence_stddev: f64,
+    /// Probability per robot detection of an extra duplicate entry with the same id.
+    pub duplicate_robot_rate: f64,
+    /// Scripted vision outages (no packets at all) in sim time.
+    pub outages: Vec<VisionOutage>,
     /// Detection frame rate [Hz], all cameras.
     pub frame_rate: f64,
     /// Attach the geometry packet every N frames (1 = every frame).
@@ -392,13 +593,27 @@ impl Default for VisionConfig {
     fn default() -> Self {
         Self {
             cameras: Vec::new(),
-            default_camera_count: 4,
-            default_camera_height: 4.0,
-            frame_rate: 60.0,
-            geometry_every_n_frames: 30,
+            default_camera_count: 2,
+            default_camera_height: 6.4,
+            default_camera_x_fraction: 0.20,
+            fov_radius: 6.6,
+            camera_phase: CameraPhase::Locked,
+            phase_offsets: Vec::new(),
+            report_area: true,
+            area_at_nadir_px: 63.0,
+            spurious_ball_area_px: 32.0,
+            spurious_ball_forward: 0.13,
+            spurious_ball_lateral_stddev: 0.07,
+            robot_confidence_mean: 0.9,
+            ball_confidence_mean: 0.9,
+            confidence_stddev: 0.05,
+            duplicate_robot_rate: 3.0e-5,
+            outages: Vec::new(),
+            frame_rate: 73.3,
+            geometry_every_n_frames: 73,
             report_ball_z: false,
             timestamp_epoch_offset: 0.0,
-            focal_length_px: 390.0,
+            focal_length_px: 1420.0,
         }
     }
 }
@@ -444,6 +659,20 @@ pub struct Realism {
     pub object_position_offset: f64,
     /// Fixed delay applied to incoming robot commands [s].
     pub command_delay: f64,
+    /// Std of the smooth per-camera position warp [m] (spatially varying calibration error).
+    pub calibration_warp_stddev: f64,
+    /// Spatial scale of the warp [m] (larger = smoother).
+    pub calibration_warp_length: f64,
+    /// Constant per-camera orientation offset [rad] (random sign per camera).
+    pub calibration_orientation_offset: f64,
+    /// Std of the spatially varying orientation warp [rad].
+    pub calibration_orientation_warp: f64,
+    /// Kick direction error [rad], one draw per kick.
+    pub kick_direction_stddev: f64,
+    /// Chip launch elevation error [rad], one draw per chip.
+    pub chip_angle_stddev: f64,
+    /// Multiplicative kick speed error (std of the factor), one draw per kick.
+    pub kick_speed_factor_stddev: f64,
 }
 
 impl Default for Realism {
@@ -474,11 +703,18 @@ impl Realism {
             simulate_dribbling: true,
             object_position_offset: 0.0,
             command_delay: 0.0,
+            calibration_warp_stddev: 0.0,
+            calibration_warp_length: 3.0,
+            calibration_orientation_offset: 0.0,
+            calibration_orientation_warp: 0.0,
+            kick_direction_stddev: 0.0,
+            chip_angle_stddev: 0.0,
+            kick_speed_factor_stddev: 0.0,
         }
     }
 
     /// ER-Force "Friendly" preset.
-    pub fn friendly() -> Self {
+    pub fn erforce_friendly() -> Self {
         Self {
             stddev_ball_p: 0.0004,
             stddev_robot_p: 0.0003,
@@ -497,8 +733,8 @@ impl Realism {
         }
     }
 
-    /// ER-Force "Realistic" preset (default).
-    pub fn realistic() -> Self {
+    /// ER-Force "Realistic" preset.
+    pub fn erforce_realistic() -> Self {
         Self {
             stddev_ball_p: 0.0014,
             stddev_robot_p: 0.0013,
@@ -518,7 +754,7 @@ impl Realism {
     }
 
     /// ER-Force "RC2021" preset (tournament conditions, glued dribbler).
-    pub fn rc2021() -> Self {
+    pub fn erforce_rc2021() -> Self {
         Self {
             stddev_ball_p: 0.0010,
             stddev_robot_p: 0.0013,
@@ -538,13 +774,70 @@ impl Realism {
         }
     }
 
-    /// Look up a preset by name (case-insensitive).
+    /// Measured from ten 2026 game logs (German Open + RoboCup, pooled). The
+    /// default. See `docs/calibration/vision.md` and `dynamics.md`.
+    pub fn realistic() -> Self {
+        Self {
+            stddev_ball_p: 0.0007,
+            stddev_robot_p: 0.0005,
+            stddev_robot_phi: 0.005,
+            stddev_ball_area: 3.3,
+            enable_invisible_ball: true,
+            ball_visibility_threshold: 0.4,
+            camera_overlap: 0.8,
+            dribbler_ball_detections: 0.02,
+            camera_position_error: 0.02,
+            robot_command_loss: 0.01,
+            robot_response_loss: 0.01,
+            missing_ball_detections: 0.007,
+            missing_robot_detections: 0.002,
+            vision_delay: 0.022,
+            vision_processing_time: 0.0073,
+            simulate_dribbling: true,
+            object_position_offset: 0.02,
+            command_delay: 0.0,
+            calibration_warp_stddev: 0.012,
+            calibration_warp_length: 3.0,
+            calibration_orientation_offset: 0.02,
+            calibration_orientation_warp: 0.02,
+            kick_direction_stddev: 2.5f64.to_radians(),
+            chip_angle_stddev: 6.0f64.to_radians(),
+            kick_speed_factor_stddev: 0.10,
+        }
+    }
+
+    /// German Open 2026 venue: no `area`, many dribbler-LED false balls, no constant camera offset.
+    pub fn go26() -> Self {
+        Self {
+            dribbler_ball_detections: 0.06,
+            object_position_offset: 0.005,
+            calibration_warp_stddev: 0.014,
+            ..Self::realistic()
+        }
+    }
+
+    /// RoboCup 2026 venue: `area` reported, few false balls, 2-2.6 cm constant x offset between cameras.
+    pub fn rc26() -> Self {
+        Self {
+            dribbler_ball_detections: 0.0015,
+            object_position_offset: 0.023,
+            calibration_warp_stddev: 0.009,
+            ..Self::realistic()
+        }
+    }
+
+    /// Look up a preset by name (case-insensitive): `none`, `realistic`
+    /// (measured, default), `go26`, `rc26`, `erforce_friendly`,
+    /// `erforce_realistic`, `erforce_rc2021` (aliases `friendly`, `rc2021`).
     pub fn preset(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "none" => Some(Self::none()),
-            "friendly" => Some(Self::friendly()),
-            "realistic" => Some(Self::realistic()),
-            "rc2021" => Some(Self::rc2021()),
+            "realistic" | "measured" | "default" => Some(Self::realistic()),
+            "go26" => Some(Self::go26()),
+            "rc26" => Some(Self::rc26()),
+            "erforce_friendly" | "friendly" => Some(Self::erforce_friendly()),
+            "erforce_realistic" => Some(Self::erforce_realistic()),
+            "erforce_rc2021" | "rc2021" => Some(Self::erforce_rc2021()),
             _ => None,
         }
     }

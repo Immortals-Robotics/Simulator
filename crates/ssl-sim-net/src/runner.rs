@@ -296,7 +296,11 @@ impl Runner {
             if let Err(e) = self.publisher.publish(out) {
                 tracing::warn!(error = %e, "vision publish failed");
             }
-            self.status.advance_frame();
+            // One output per camera capture; the legacy 10-frame kick window is
+            // counted in *vision* frames, so only the first camera ticks it.
+            if out.camera_index == 0 {
+                self.status.advance_frame();
+            }
         }
         if self.publisher.truth_enabled() {
             let snapshot = self.world.snapshot();
@@ -522,19 +526,6 @@ pub fn sleep_precise(d: Duration) {
 /// `SimulatorCommand` (`{1: SimulatorControl, 2: SimulatorConfig}`), which
 /// overlaps on field 2, so only a fixed32 field 1 or a field 3 are decisive and
 /// the caller falls back to trying both decoders.
-/// Hex dump of the first `n` bytes (for debug logging).
-fn hex_prefix(bytes: &[u8], n: usize) -> String {
-    let mut s = String::with_capacity(n * 2 + 3);
-    for b in bytes.iter().take(n) {
-        use std::fmt::Write as _;
-        let _ = write!(s, "{b:02x}");
-    }
-    if bytes.len() > n {
-        s.push_str("...");
-    }
-    s
-}
-
 pub fn looks_like_sync(bytes: &[u8], primary_is_robot_control: bool) -> bool {
     let mut decisive = false;
     for (field, wire) in TagScan::new(bytes) {
@@ -547,6 +538,19 @@ pub fn looks_like_sync(bytes: &[u8], primary_is_robot_control: bool) -> bool {
         }
     }
     decisive
+}
+
+/// Hex dump of the first `n` bytes (for debug logging).
+fn hex_prefix(bytes: &[u8], n: usize) -> String {
+    let mut s = String::with_capacity(n * 2 + 3);
+    for b in bytes.iter().take(n) {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    if bytes.len() > n {
+        s.push_str("...");
+    }
+    s
 }
 
 /// Iterator over the `(field_number, wire_type)` pairs of a protobuf message's

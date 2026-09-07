@@ -95,10 +95,11 @@ pub fn handle_sync_request(
     }
 
     let vision = world.drain_vision();
+    // Every frame released during the step, in capture order (one per camera
+    // capture; cameras run on independent phases).
     let detection = vision
         .iter()
-        .flat_map(|out| out.frames.iter())
-        .map(convert::detection_frame_to_proto)
+        .map(|out| convert::detection_frame_to_proto(&out.frame))
         .collect();
 
     if !errors.is_empty() {

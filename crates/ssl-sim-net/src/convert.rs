@@ -605,7 +605,10 @@ pub fn field_from_geometry(mut field: FieldGeometry, geo: &sim::SslGeometryData)
 fn detection_ball_to_proto(b: &DetectedBall) -> sim::SslDetectionBall {
     sim::SslDetectionBall {
         confidence: b.confidence as f32,
-        area: Some(b.area.max(0.0).round() as u32),
+        // `area` is optional on the wire and a whole tournament in the 2026
+        // corpus reported none at all (vision.md §3, §9.9); `report_area = false`
+        // reproduces that.
+        area: b.area.map(|a| a.max(0.0).round() as u32),
         x: (b.pos.x * MM_PER_M) as f32,
         y: (b.pos.y * MM_PER_M) as f32,
         z: b.z.map(|z| (z * MM_PER_M) as f32),
@@ -755,12 +758,20 @@ pub fn camera_calibration_to_proto(c: &CameraCalibration) -> sim::SslGeometryCam
     }
 }
 
-/// The advertised ball models. These are the very constants the core simulates.
+/// The advertised ball models. These are the very constants the core
+/// simulates, with one deliberate translation: the wire model is a *constant*
+/// rolling deceleration, while the core rolls with a speed-dependent one, so
+/// the packet carries [`BallParams::advertised_acc_roll`] — the value at
+/// `advertise_roll_speed` — instead of the zero-speed `acc_roll`
+/// (`docs/calibration/dynamics.md`).
+///
+/// `SSL_BallModelChipFixedLoss` likewise only has room for the **first hop**
+/// damping factors; the later-hop constants the core uses are not advertised.
 pub fn ball_models_to_proto(ball: &BallParams) -> sim::SslGeometryModels {
     sim::SslGeometryModels {
         straight_two_phase: Some(sim::SslBallModelStraightTwoPhase {
             acc_slide: ball.acc_slide,
-            acc_roll: ball.acc_roll,
+            acc_roll: ball.advertised_acc_roll(),
             k_switch: ball.k_switch(),
         }),
         chip_fixed_loss: Some(sim::SslBallModelChipFixedLoss {
@@ -786,19 +797,18 @@ pub fn geometry_to_proto(geo: &GeometryData) -> sim::SslGeometryData {
     }
 }
 
-/// One wrapper packet per camera. The geometry, when present, rides on the
-/// packet of the first camera (camera 0 in the default setup).
-pub fn vision_output_to_packets(out: &VisionOutput) -> Vec<sim::SslWrapperPacket> {
-    let geometry = out.geometry.as_ref().map(geometry_to_proto);
-    out.frames
-        .iter()
-        .enumerate()
-        .map(|(i, f)| sim::SslWrapperPacket {
-            detection: Some(detection_frame_to_proto(f)),
-            geometry: if i == 0 { geometry.clone() } else { None },
-            source: Some(sim::SslSource::Other as i32),
-        })
-        .collect()
+/// One wrapper packet per camera capture.
+///
+/// Cameras capture on independent schedules (see
+/// [`ssl_sim_core::vision`]), so a [`VisionOutput`] is one camera's frame; the
+/// geometry, when the core attached one, rides on it (only camera 0's outputs
+/// ever carry geometry).
+pub fn vision_output_to_packet(out: &VisionOutput) -> sim::SslWrapperPacket {
+    sim::SslWrapperPacket {
+        detection: Some(detection_frame_to_proto(&out.frame)),
+        geometry: out.geometry.as_ref().map(geometry_to_proto),
+        source: Some(sim::SslSource::Other as i32),
+    }
 }
 
 // --------------------------------------------------------------------------

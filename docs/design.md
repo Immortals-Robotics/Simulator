@@ -279,41 +279,73 @@ team (grSim "inside" formation; configurable list).
 
 ### 5.5 Vision model
 
-Cameras: `n_cameras` (default 4; 2 for Div B optional), positions default
-`(±L/4, ±W/4, 4.0 m)`, configurable. Frame period default 1/60 s with optional
-per-camera phase offset; frames for all cameras are generated at the same sim
-time by default (matches existing tooling expectations).
+Calibrated against ten 2026 division-A/B game logs; `docs/calibration/vision.md`
+§8 is the value table and §9 the list of model changes the data demanded.
+
+Cameras: `default_camera_count` (default **2**, the only rig seen on a
+division-A field; 1 for Div B, 4 supported), auto-placed at
+`(±default_camera_x_fraction·L, 0)` for two and `(±fraction·L, ±W/4)` for four,
+at `default_camera_height` (**6.4 m**), all configurable or overridden by an
+explicit `[[vision.cameras]]` list. Frame period **1/73.3 s** per camera.
+
+Each camera has its **own** capture instant: `camera_phase = locked` uses
+`phase_offsets[i]` within the period, `free_running` draws one uniform phase per
+camera from the seeded `calibration` stream at first capture. Every capture is
+its own `VisionOutput` (exactly one `DetectionFrame`) and its own
+`SSL_WrapperPacket`; capture instants are quantised to the substep.
+
+Static per-camera calibration state, drawn once from the `calibration` stream:
+a constant position offset of magnitude `object_position_offset` in a random
+direction, a smooth position warp (sum of low-frequency plane waves, std
+`calibration_warp_stddev`, wavelength `calibration_warp_length`, normalised over
+the field), a constant orientation offset with random sign, and an orientation
+warp. This is the dominant error a client sees (20 mm between cameras versus
+0.4 mm of white noise) and is applied before the Gaussian noise.
 
 Per frame, per camera:
 
 1. Region test: Manhattan-Voronoi with band `2·camera_overlap`
-   (`own ≤ min + 2·overlap`), ER-Force rule and test vectors.
-2. Robots: pose + per-camera radial `object_position_offset` + Gaussian
-   `stddev_robot_p`, `stddev_robot_phi`; dropped with `missing_robot_detections`.
-   Height field = robot height. `confidence` 1.0.
+   (`own ≤ min + 2·overlap`, ER-Force rule and test vectors) **and** a hard
+   field-of-view disc of `fov_radius` (6.6 m) around the nadir.
+2. Robots: pose + static calibration error + Gaussian `stddev_robot_p`,
+   `stddev_robot_phi`; dropped with `missing_robot_detections`. Height field =
+   `RobotSpecs::height`. `confidence ~ N(robot_confidence_mean,
+   confidence_stddev)` clamped to (0, 1]. With probability
+   `duplicate_robot_rate` a second entry with the same id and independent noise
+   is emitted.
 3. Ball: floor projection through the camera pinhole using the true camera
    position: `p' = c_xy + (p_xy − c_xy)·c_z/(c_z − min(z − r, 0.9 c_z))`;
-   `area` from projected distance (ER-Force formula, FOCAL 390, PIXEL_PER_AREA
-   10) plus `stddev_ball_area`; occlusion (if enabled): 15×15 samples on the
-   ball disc facing the camera, each ray tested analytically against every
-   robot cylinder; visible fraction < `ball_visibility_threshold` ⇒ dropped,
-   else reported at the centroid of visible samples; then noise and
-   `missing_ball_detections`. `z` omitted unless `report_ball_z`.
+   `area = area_at_nadir_px · visibility · height_term` (no horizontal distance
+   term — measured `area` is flat over the working area; `PIXEL_PER_AREA = 1`,
+   `focal_length_px` is the real calibrated focal length and only enters the
+   height term and the geometry packet) plus `stddev_ball_area`; occlusion (if
+   enabled): 15×15 samples on the ball disc facing the camera, each ray tested
+   analytically against every robot cylinder; visible fraction <
+   `ball_visibility_threshold` ⇒ dropped, else reported at the centroid of
+   visible samples; then noise and `missing_ball_detections`. `z` omitted unless
+   `report_ball_z`; `area` omitted entirely unless `report_area`.
 4. Spurious dribbler balls with rate `dribbler_ball_detections` per robot per
-   second at the dribbler corner (0.03 m forward), through the same pipeline.
+   second, on the robot's centreline `spurious_ball_forward` (0.13 m) ahead of
+   its centre with lateral `N(0, spurious_ball_lateral_stddev)` and area
+   `spurious_ball_area_px`.
 5. Multiple balls are shuffled with the seeded RNG.
 6. `frame_number` per camera, `t_capture = t + delay − processing`,
    `t_sent = t + delay` (sim seconds; plus a configurable epoch offset so the
    values look like Unix time for tools that care).
 
+While sim time is inside a configured `[[vision.outages]]` window nothing is
+emitted at all; frame numbers and the geometry cadence keep running, so
+geometry goes out on the first frame after the gap.
+
 Packets are queued with due time `t + vision_delay` and released when the
 loop's sim time passes it (so fast mode and sync mode behave identically).
-One `SSL_WrapperPacket` per camera is always emitted, even if empty. The
-geometry packet (field, lines, arcs, ball models, one calibration per camera
-with correct `derived_camera_world_t*` and a self-consistent quaternion,
+One `SSL_WrapperPacket` per camera capture is always emitted, even if empty. The
+geometry packet (field, lines, arcs, ball models — with the *advertised*
+`acc_roll` for the wire's constant-deceleration model — one calibration per
+camera with correct `derived_camera_world_t*` and a self-consistent quaternion,
 optionally perturbed by `camera_position_error`) is attached to camera 0's
-packet every `geometry_every_n_frames` (default 30, like grSim's effective
-behaviour; 1 also supported).
+packets every `geometry_every_n_frames` of that camera (default 73 = 1.00 s;
+1 also supported).
 
 A ground-truth stream (`TrackedWrapperPacket` on 224.5.23.2:10010) is optional
 and off by default; it carries exact ball 3D pos/vel and robot pos/vel with
@@ -323,16 +355,29 @@ and off by default; it carries exact ball 3D pos/vel and robot pos/vel with
 
 Flat struct `Realism`, loadable from TOML and from the wire via
 `RealismConfigErForce` packed in `RealismConfig.custom` (so Ra-style tooling
-and existing team scripts work). Fields exactly as ER-Force's 17 plus
-`report_ball_z`, `vision_frame_rate`, `geometry_every_n_frames`. Presets
-`none`, `friendly`, `realistic`, `rc2021` with ER-Force's values; default
-`realistic` for the CLI. Robot command loss / response loss are applied in the
-net layer with their own seeded RNG stream.
+and existing team scripts work). Fields: ER-Force's 17, plus the calibration
+warp (`calibration_warp_stddev`, `calibration_warp_length`,
+`calibration_orientation_offset`, `calibration_orientation_warp`), the kick
+imperfections (`kick_direction_stddev`, `chip_angle_stddev`,
+`kick_speed_factor_stddev`) and `command_delay`; the extras are config-file
+only, since the ER-Force message has no room for them. Rig geometry and what a
+camera reports live in `VisionConfig` instead.
+
+Presets: `none`, **`realistic` (default, measured from the 2026 corpus)**,
+`go26` and `rc26` (its two venues), and ER-Force's own values under
+`erforce_friendly`, `erforce_realistic`, `erforce_rc2021` (aliases `friendly`,
+`rc2021`). `BallParams::preset` and `RobotLimits::preset` are the equivalents
+for the physics tables, exposed as `--ball-preset` and `--robot-limits`. Robot
+command loss / response loss are applied in the net layer with their own seeded
+RNG stream.
 
 ### 5.7 Randomness and determinism
 
-`Rngs { vision_noise, vision_dropout, packet_loss, shuffle }`, each a
-`Xoshiro256++` seeded from `seed` + stream id. `seed` comes from config/CLI
+`Rngs { vision_noise, vision_dropout, packet_loss, shuffle, physics,
+calibration }`, each a `Xoshiro256++` seeded from `seed` + stream id.
+`calibration` is drawn from exactly once per camera rig (phases, offset
+directions, warp coefficients), so per-frame randomness never shifts the static
+calibration and vice versa. `seed` comes from config/CLI
 (default: fixed 0 so runs are reproducible unless the user asks for
 `--seed random`). Robot iteration is `BTreeMap` order. No floating point
 reductions depend on hash order. The core has a `state_hash()` used by the
@@ -381,10 +426,11 @@ determinism test.
 ```
 ssl-sim run [--config sim.toml] [--division a|b] [--robots 11]
             [--mode realtime|fast|sync] [--speed 1.0] [--step-ms 1]
-            [--realism none|friendly|realistic|rc2021|<file>]
+            [--realism none|realistic|go26|rc26|erforce_*|<file>]
+            [--ball-preset <name>] [--robot-limits <name>] [--cameras 1|2|4]
             [--seed N|random] [--vision-addr 224.5.23.2:10020] [--localhost]
             [--truth] [--no-legacy-grsim] [--log-level info]
-ssl-sim presets      # print built-in realism / field / robot presets as TOML
+ssl-sim presets      # default config as TOML + every preset name and what it is
 ```
 
 Realtime loop: accumulate wall time × speed, run whole substeps, publish due
@@ -433,7 +479,7 @@ README, memory notes.
 Implemented and tested: everything in §3–§8 except the items below. Full
 workspace: 144 tests, clippy clean. Throughput on the reference machine:
 about 17 µs per substep with 22 commanded robots in release (60× real time
-including 60 Hz vision), 20 µs measured by the running CLI.
+including 73.3 Hz vision on two cameras), 20 µs measured by the running CLI.
 
 Deviations and simplifications, all deliberate:
 - `realism.command_delay` is accepted in config but not applied; commands
@@ -453,7 +499,12 @@ Deviations and simplifications, all deliberate:
   `spin_retention`, not reflected with angular-momentum transfer.
 - Vision: robots are never occluded; positional noise is not a function of
   ball height (only `area` carries it); spurious dribbler balls skip the
-  occlusion re-test; camera calibration error is a deterministic offset.
+  occlusion re-test; the *advertised* `camera_position_error` is still a
+  deterministic offset (the error a client can see is the drawn per-camera
+  calibration warp instead); the geometry packet still advertises a fixed
+  (300, 300) principal point, zero distortion and no image size, and one focal
+  length for the whole rig, while real rigs mix sensors; capture instants are
+  quantised to the substep (±0.5 ms at the 1 ms default).
 - Goal posts are zero-thickness double-sided segments on the post centre line.
 - `TeleportRobot` with position but no orientation is accepted (ER-Force
   rejects it) because the Immortals `Software` client sends that.

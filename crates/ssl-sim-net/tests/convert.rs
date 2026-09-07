@@ -419,7 +419,10 @@ fn penalty_area_is_derived_from_the_stretch_lines_when_absent() {
 // vision output: core -> wire
 // --------------------------------------------------------------------------
 
-fn sample_vision_output(with_geometry: bool) -> VisionOutput {
+/// One camera's capture. Cameras have independent capture instants, so a
+/// `VisionOutput` carries exactly one frame; only camera 0's outputs ever get
+/// a geometry packet attached.
+fn sample_vision_output(camera_id: u32, with_geometry: bool) -> VisionOutput {
     let frame = |camera_id: u32| DetectionFrame {
         camera_id,
         frame_number: 7 + camera_id,
@@ -428,7 +431,7 @@ fn sample_vision_output(with_geometry: bool) -> VisionOutput {
         balls: vec![DetectedBall {
             pos: Vec2::new(1.5, -2.25),
             z: Some(0.1),
-            area: 123.4,
+            area: Some(123.4),
             confidence: 0.95,
         }],
         robots_blue: vec![DetectedRobot {
@@ -449,7 +452,8 @@ fn sample_vision_output(with_geometry: bool) -> VisionOutput {
     let field = FieldGeometry::division(Division::A);
     VisionOutput {
         capture_time: SimTime::from_millis(1230),
-        frames: vec![frame(0), frame(1), frame(2), frame(3)],
+        camera_index: camera_id as usize,
+        frame: frame(camera_id),
         geometry: with_geometry.then(|| GeometryData {
             field,
             cameras: vec![CameraCalibration {
@@ -467,11 +471,10 @@ fn sample_vision_output(with_geometry: bool) -> VisionOutput {
 
 #[test]
 fn detections_are_converted_to_millimetres() {
-    let out = sample_vision_output(false);
-    let packets = convert::vision_output_to_packets(&out);
-    assert_eq!(packets.len(), 4, "one wrapper packet per camera");
+    let out = sample_vision_output(0, false);
+    let packet = convert::vision_output_to_packet(&out);
 
-    let detection = packets[0].detection.as_ref().unwrap();
+    let detection = packet.detection.as_ref().unwrap();
     assert_eq!(detection.camera_id, 0);
     assert_eq!(detection.frame_number, 7);
     assert!((detection.t_capture - 1.230).abs() < 1e-9);
@@ -498,23 +501,39 @@ fn detections_are_converted_to_millimetres() {
     assert_eq!(yellow.robot_id, Some(9));
     assert!((yellow.x - 2000.0).abs() < 1e-3);
 
-    // No geometry was requested, so no packet carries one.
-    assert!(packets.iter().all(|p| p.geometry.is_none()));
+    // No geometry was requested, so the packet carries none.
+    assert!(packet.geometry.is_none());
 }
 
 #[test]
-fn geometry_rides_on_camera_zero_only() {
-    let out = sample_vision_output(true);
-    let packets = convert::vision_output_to_packets(&out);
-    assert!(packets[0].geometry.is_some());
-    assert!(packets[1..].iter().all(|p| p.geometry.is_none()));
+fn one_packet_per_camera_capture_and_geometry_rides_along() {
+    // Camera 1 captured on its own phase: one packet, no geometry.
+    let out = sample_vision_output(1, false);
+    let packet = convert::vision_output_to_packet(&out);
+    assert_eq!(packet.detection.as_ref().unwrap().camera_id, 1);
+    assert!(packet.geometry.is_none());
+
+    // Camera 0's capture is the one the core attaches geometry to.
+    let out = sample_vision_output(0, true);
+    let packet = convert::vision_output_to_packet(&out);
+    assert_eq!(packet.detection.as_ref().unwrap().camera_id, 0);
+    assert!(packet.geometry.is_some());
+}
+
+#[test]
+fn ball_area_is_omitted_when_the_core_reports_none() {
+    let mut out = sample_vision_output(0, false);
+    out.frame.balls[0].area = None;
+    let packet = convert::vision_output_to_packet(&out);
+    let ball = &packet.detection.as_ref().unwrap().balls[0];
+    assert_eq!(ball.area, None, "a rig without `area` sends no area field");
 }
 
 #[test]
 fn geometry_packet_carries_field_lines_and_ball_models() {
-    let out = sample_vision_output(true);
-    let packets = convert::vision_output_to_packets(&out);
-    let geo = packets[0].geometry.as_ref().unwrap();
+    let out = sample_vision_output(0, true);
+    let packet = convert::vision_output_to_packet(&out);
+    let geo = packet.geometry.as_ref().unwrap();
 
     assert_eq!(geo.field.field_length, 12_000);
     assert_eq!(geo.field.field_width, 9_000);
@@ -577,12 +596,23 @@ fn geometry_packet_carries_field_lines_and_ball_models() {
         Some(sim::SslFieldShapeType::CenterCircle as i32)
     );
 
-    // Ball models are the very constants the core simulates.
+    // Ball models are the constants the core simulates, except that the wire
+    // model has only a constant rolling deceleration: the packet advertises the
+    // value at `advertise_roll_speed`, not the zero-speed `acc_roll`.
     let params = BallParams::default();
     let models = geo.models.as_ref().unwrap();
     let straight = models.straight_two_phase.as_ref().unwrap();
     assert!((straight.acc_slide - params.acc_slide).abs() < 1e-12);
-    assert!((straight.acc_roll - params.acc_roll).abs() < 1e-12);
+    assert!(
+        (straight.acc_roll - params.advertised_acc_roll()).abs() < 1e-12,
+        "advertised acc_roll {} should be the value at {} m/s",
+        straight.acc_roll,
+        params.advertise_roll_speed
+    );
+    assert!(
+        straight.acc_roll < params.acc_roll,
+        "the speed term makes the advertised value more negative than acc_roll"
+    );
     assert!((straight.k_switch - params.k_switch()).abs() < 1e-12);
     let chip = models.chip_fixed_loss.as_ref().unwrap();
     assert!((chip.damping_xy_first_hop - params.chip_damping_xy_first_hop).abs() < 1e-12);
@@ -592,9 +622,9 @@ fn geometry_packet_carries_field_lines_and_ball_models() {
 
 #[test]
 fn camera_calibration_extrinsics_are_self_consistent() {
-    let out = sample_vision_output(true);
-    let packets = convert::vision_output_to_packets(&out);
-    let calib = &packets[0].geometry.as_ref().unwrap().calib[0];
+    let out = sample_vision_output(0, true);
+    let packet = convert::vision_output_to_packet(&out);
+    let calib = &packet.geometry.as_ref().unwrap().calib[0];
 
     // Camera at (-3, -2.25, 4) m => (-3000, -2250, 4000) mm.
     assert_eq!(calib.derived_camera_world_tx, Some(-3000.0));

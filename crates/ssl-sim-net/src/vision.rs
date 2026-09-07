@@ -89,12 +89,9 @@ impl VisionPublisher {
         self.socket.send_to(&self.buf, self.addr).map(|_| ())
     }
 
-    /// Send every wrapper packet of one vision output (one per camera).
+    /// Send the wrapper packet of one camera capture.
     pub fn publish(&mut self, out: &VisionOutput) -> std::io::Result<()> {
-        for packet in convert::vision_output_to_packets(out) {
-            self.publish_packet(&packet)?;
-        }
-        Ok(())
+        self.publish_packet(&convert::vision_output_to_packet(out))
     }
 
     /// Send a ground-truth frame if the truth stream is enabled.

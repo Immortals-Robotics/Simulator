@@ -5,12 +5,19 @@
 # The file deserialises into `ssl_sim_core::params::SimConfig`. Every table and
 # every key is optional (`#[serde(default)]` throughout), so a config that only
 # overrides `[realism]` is perfectly valid. Command-line flags win over the
-# file: --robots, --step-ms, --seed and --realism all override what is here.
+# file: --robots, --step-ms, --seed, --realism, --ball-preset, --robot-limits
+# and --cameras all override what is here.
 #
-# Regenerate a fresh copy of this file at any time with `ssl-sim presets`.
+# Regenerate a fresh copy of this file at any time with `ssl-sim presets`,
+# which also prints every preset name with a one-line description.
 #
 # Units are SI: metres, seconds, radians, kilograms. The wire protocols use
 # millimetres and nanoseconds; that conversion happens in `ssl-sim-net` only.
+#
+# Where a value was measured, the comment cites the section of
+# `docs/calibration/vision.md` or `docs/calibration/dynamics.md` it comes from.
+# Those two files are the reading of ten 2026 division-A/B game logs (German
+# Open + RoboCup, 6.6 hours of play, 3.2 M detection frames).
 
 # Physics substep [s]. 1 ms is the design point; --step-ms overrides it.
 substep = 0.001
@@ -26,23 +33,36 @@ wall_height = 0.1
 initial_robots_per_team = 11
 
 # --------------------------------------------------------------------------
-# Ball. These constants are simulated *and* advertised verbatim in the
-# geometry packet's SSL_BallModelStraightTwoPhase / SSL_BallModelChipFixedLoss,
-# so a client's prediction model matches the simulation exactly.
+# Ball. These constants are simulated *and* advertised in the geometry
+# packet's SSL_BallModelStraightTwoPhase / SSL_BallModelChipFixedLoss, so a
+# client's prediction model matches the simulation. The one translation: the
+# wire model only has a *constant* rolling deceleration, so the packet
+# advertises `acc_roll - roll_speed_coefficient * advertise_roll_speed`
+# (`BallParams::advertised_acc_roll`), and only the first-hop chip damping
+# factors fit on the wire.
+#
+# `--ball-preset default|go26|rc26|erforce|tigers|grsim` swaps this table.
 # --------------------------------------------------------------------------
 [ball]
 radius = 0.0215
 mass = 0.046
-# Sliding deceleration [m/s^2], negative.
-acc_slide = -3.0
-# Rolling deceleration [m/s^2], negative.
-acc_roll = -0.3
+# Sliding deceleration [m/s^2], negative (dynamics.md).
+acc_slide = -3.3
+# Rolling deceleration at *zero* speed [m/s^2], negative.
+acc_roll = -0.22
+# Extra rolling deceleration per m/s of speed [1/s]: real rolling is not
+# constant, it grows with speed (dynamics.md).
+roll_speed_coefficient = 0.045
+# Speed [m/s] at which `acc_roll` is advertised to clients that assume a
+# constant: -0.22 - 0.045 * 1.5 = -0.2875 m/s^2.
+advertise_roll_speed = 1.5
 # Inertia distribution p = I/(m r^2); the advertised k_switch is 1/(1+p).
 inertia_distribution = 0.5
-# Chip bounce damping (TIGERs field measurements).
-chip_damping_xy_first_hop = 0.75
-chip_damping_xy_other_hops = 0.95
-chip_damping_z = 0.5
+# Chip bounce damping. Only the *first hop* pair is advertised on the wire.
+chip_damping_xy_first_hop = 0.7
+chip_damping_xy_other_hops = 0.87
+chip_damping_z = 0.46
+chip_damping_z_other_hops = 0.4
 # Below this apex height [m] the ball is grounded.
 min_hop_height = 0.01
 # Below this speed [m/s] the ball snaps to rest.
@@ -55,40 +75,50 @@ rest_speed = 0.01
 # --------------------------------------------------------------------------
 [contact]
 ball_robot_normal = 0.5
-ball_robot_tangent = 0.0
-ball_kicker_normal = 0.6
-ball_kicker_tangent = 0.3
+ball_robot_tangent = 0.3
+ball_kicker_normal = 0.8
+ball_kicker_tangent = 0.4
 ball_wall_normal = 0.5
 ball_wall_tangent = 0.0
 spin_retention = 0.6
 robot_robot_restitution = 0.2
 robot_robot_friction = 0.1
 robot_wall_restitution = 0.1
+# Ball landing on a robot's flat top.
+ball_robot_top_normal = 0.54
+ball_robot_top_tangent = 0.3
+# Use the flat front chord in robot-robot contacts (false = discs only).
+robot_hull_chord_contacts = true
 
 # --------------------------------------------------------------------------
 # Default robot specs per team. Live `RobotSpecs` messages on the control port
 # override individual fields at runtime; anything not on the wire keeps the
-# value configured here.
+# value configured here. `--robot-limits <preset>` replaces the `limits`
+# sub-table of both teams.
 # --------------------------------------------------------------------------
 [blue_specs]
 radius = 0.09
+# Reported in every detection as SSL_DetectionRobot.height. Real logs carry
+# 135-150 mm (vision.md §3).
 height = 0.15
 mass = 2.5
 # Distance centre -> kicker face [m]; defines the flat front chord and the
 # mouth half-angle acos(center_to_dribbler / radius).
 center_to_dribbler = 0.075
 dribbler_width = 0.07
-# Ball centre distance from the robot centre when seated on the dribbler [m].
-shoot_radius = 0.067
+# Ball centre distance from the robot centre when seated on the dribbler [m];
+# measured 0.097-0.099 m in 2026 games (dynamics.md).
+shoot_radius = 0.0965
 # inertia_z is optional; omitted means 0.5 * mass * radius^2.
 
+# Firmware movement limits, fitted from 2026 game logs (dynamics.md).
 [blue_specs.limits]
-acc_speedup_absolute_max = 4.0
-acc_speedup_angular_max = 50.0
-acc_brake_absolute_max = 6.0
-acc_brake_angular_max = 50.0
-vel_absolute_max = 3.5
-vel_angular_max = 20.0
+acc_speedup_absolute_max = 3.5
+acc_speedup_angular_max = 40.0
+acc_brake_absolute_max = 5.0
+acc_brake_angular_max = 40.0
+vel_absolute_max = 3.0
+vel_angular_max = 12.0
 
 # Wheel mounting angles [rad], CCW from robot +x, in the protocol order
 # (front_right, back_right, back_left, front_left). These are grSim's
@@ -126,11 +156,17 @@ incoming_damping = 1.0
 [blue_specs.dribbler]
 # rpm at which the holding force is maximal; commands are normalised by this.
 max_speed_rpm = 10000.0
-hold_accel = 4.0
+# Mean holding acceleration [m/s^2] and the per-robot spread around it: real
+# dribblers differ from robot to robot, so each robot draws its own value from
+# N(hold_accel, hold_accel_stddev) with the seeded `physics` stream, clamped at
+# hold_accel_min. Set the stddev to 0 for identical robots.
+hold_accel = 3.0
+hold_accel_stddev = 1.0
+hold_accel_min = 1.5
 roller_radius = 0.007
-seat_depth = 0.008
-# true = perfect "glue" mode. The RC2021 realism preset turns this on via
-# simulate_dribbling = false.
+seat_depth = 0.0
+# true = perfect "glue" mode. The erforce_rc2021 realism preset turns this on
+# via simulate_dribbling = false.
 glue = false
 
 [yellow_specs]
@@ -139,15 +175,15 @@ height = 0.15
 mass = 2.5
 center_to_dribbler = 0.075
 dribbler_width = 0.07
-shoot_radius = 0.067
+shoot_radius = 0.0965
 
 [yellow_specs.limits]
-acc_speedup_absolute_max = 4.0
-acc_speedup_angular_max = 50.0
-acc_brake_absolute_max = 6.0
-acc_brake_angular_max = 50.0
-vel_absolute_max = 3.5
-vel_angular_max = 20.0
+acc_speedup_absolute_max = 3.5
+acc_speedup_angular_max = 40.0
+acc_brake_absolute_max = 5.0
+acc_brake_angular_max = 40.0
+vel_absolute_max = 3.0
+vel_angular_max = 12.0
 
 [yellow_specs.wheel_angles]
 front_right = -1.0471975511965976
@@ -177,73 +213,202 @@ incoming_damping = 1.0
 
 [yellow_specs.dribbler]
 max_speed_rpm = 10000.0
-hold_accel = 4.0
+hold_accel = 3.0
+hold_accel_stddev = 1.0
+hold_accel_min = 1.5
 roller_radius = 0.007
-seat_depth = 0.008
+seat_depth = 0.0
 glue = false
 
 # --------------------------------------------------------------------------
-# Vision geometry. Noise and dropouts live in [realism]; this table is the
-# camera rig itself.
+# Vision geometry: the camera rig and what a camera reports. Noise, dropouts
+# and the calibration error live in [realism].
+#
+# Every default in this table is measured; `docs/calibration/vision.md` §8 is
+# the summary table and §9 lists the model changes the data demanded.
 # --------------------------------------------------------------------------
 [vision]
 # Explicit cameras override the auto-placement. Each entry is
 #   [[vision.cameras]]
 #   id = 0
-#   position = [-3.0, -2.25, 4.0]
+#   position = [2.4, 0.0, 6.4]
 cameras = []
-# Cameras to auto-place when `cameras` is empty: 4 (quadrants), 2 or 1.
-default_camera_count = 4
-default_camera_height = 4.0
-# Detection frame rate [Hz] for all cameras.
-frame_rate = 60.0
-# Attach the geometry packet to camera 0 every N frames (1 = every frame).
-geometry_every_n_frames = 30
-# Report the true ball height in SSL_DetectionBall.z. Real vision does not, so
-# this is off; the ball is reported at its floor projection instead.
+# Cameras to auto-place when `cameras` is empty: 2 (measured default), 1 or 4.
+# Every division-A field in the 2026 corpus used exactly 2, division B used 1
+# (vision.md §2). --cameras N overrides this.
+default_camera_count = 2
+# Camera height [m] for auto-placement. Measured 5.97-6.52 m in every log; the
+# old 4.0 m assumption was well off (vision.md §2).
+default_camera_height = 6.4
+# Auto-placed camera x, as a fraction of the field length. Two-camera rigs sit
+# at x ~ +-2.4 m on a 12 m field = 0.20 L, *inside* the classic +-L/4
+# (vision.md §2). Four cameras also split y at +-W/4.
+default_camera_x_fraction = 0.2
+# Hard field-of-view edge [m]: a camera detects nothing further than this from
+# its nadir. Robot detection completeness is flat at 98.8-99.8 % out to 6.5 m,
+# 77.9 % at 6.75 m and 7.5 % beyond 7.25 m — a lens edge the Manhattan region
+# rule alone does not model (vision.md §4, §9.6). 0 = unlimited.
+fov_radius = 6.6
+# How the cameras' capture instants relate:
+#   "locked"       hardware trigger; each camera captures at its own fixed
+#                  offset from a common clock (see phase_offsets). Matches
+#                  RoboCup 2026 (offsets of +0.17, +1.36, -5.83 ms).
+#   "free_running" each camera draws one uniform phase over the period from
+#                  the seed. Matches the German Open, where the cross-camera
+#                  offset has sigma = T/sqrt(12) = 3.94 ms (vision.md §1, §9.1).
+# Either way each camera captures on its own schedule and each capture is its
+# own SSL_WrapperPacket.
+camera_phase = "locked"
+# Per-camera capture offsets [s] within the frame period, used by "locked".
+# Missing entries are 0, i.e. all cameras in phase. Example: [0.0, 0.00136]
+phase_offsets = []
+# Emit SSL_DetectionBall.area at all. The German Open reported *no* area on any
+# of its 941 367 ball detections, so consumers must cope with it missing
+# (vision.md §3, §9.9); set false to exercise that path.
+report_area = true
+# Blob area [px] of a ball on the floor. Measured mean 63.1 px, sigma 12.1
+# (vision.md §6). The area model is `area_at_nadir_px * visibility *
+# height_term`: there is deliberately **no** horizontal distance term, because
+# measured area is flat to +-8 % from the nadir out to 5 m where a pinhole
+# 1/d^2 predicts a 37 % fall (vision.md §9.2).
+area_at_nadir_px = 63.0
+# Area [px] of a spurious dribbler-LED ball: 24-38 px measured, 2.6x smaller
+# than a real ball, which is exactly why an area filter rejects them
+# (vision.md §6).
+spurious_ball_area_px = 32.0
+# Spurious dribbler balls sit on the robot's centreline this far ahead of its
+# *centre* [m]: measured +0.119..+0.141 m, with spikes at +0.095 and +0.145 m
+# (the geometry of an IR break beam firing into the camera, vision.md §9.7).
+spurious_ball_forward = 0.13
+# Lateral spread of those balls [m]. Measured 0.000 +- 0.07 m: they are on the
+# centreline, not at the dribbler corner our old model used.
+spurious_ball_lateral_stddev = 0.07
+# Reported confidences, drawn per detection from N(mean, confidence_stddev)
+# and clamped to (0, 1]. Measured: robots 0.896 +- 0.080, balls 0.913 +- 0.121
+# (bimodal by venue). We used to emit a constant 1.0 (vision.md §3, §9.11).
+robot_confidence_mean = 0.9
+ball_confidence_mean = 0.9
+confidence_stddev = 0.05
+# Probability per robot detection of a second entry with the *same* id and
+# independent noise. Measured 932 duplicates in 31.4 M detections = 3.0e-5;
+# rare, but a consumer that assumes uniqueness crashes on real logs, not on
+# ours (vision.md §4, §9.10).
+duplicate_robot_rate = 3e-5
+# Scripted vision outages: no packets at all while sim time is inside one
+# (frame numbers keep counting, and the geometry packet is re-sent on the first
+# frame after). Nine of ten games contain a 303-421 s gap (vision.md §1, §9.13).
+# Example:
+#   [[vision.outages]]
+#   start = 120.0
+#   duration = 310.0
+outages = []
+# Detection frame rate [Hz] per camera. Measured 73.11-73.29 Hz on all 19
+# streams of the corpus; the period is 13.644-13.678 ms (vision.md §1).
+frame_rate = 73.3
+# Attach the geometry packet to camera 0 every N of *its* frames. 73 frames at
+# 73.3 Hz = 1.00 s, which is the German Open cadence; RoboCup 2026 sent one
+# every 1.50 s (110 frames) (vision.md §2).
+geometry_every_n_frames = 73
+# Report the true ball height in SSL_DetectionBall.z. Real vision never does:
+# 0 of 1 820 478 ball detections carried z (vision.md §3). The ball is reported
+# at its floor projection instead.
 report_ball_z = false
 # Added to reported timestamps [s] so they look like Unix time to tools that
 # insist on it. 0 keeps timestamps as plain simulation seconds.
 timestamp_epoch_offset = 0.0
-# Pinhole focal length [px] used for the ball `area` model (ER-Force's 390).
-focal_length_px = 390.0
+# Pinhole focal length [px]. Real rigs calibrate at 1416-1474 px; with
+# PIXEL_PER_AREA = 1 (the reported area is simply the blob's pixel area) our
+# own formula then lands within 9 % of the measured mean area (vision.md §9.3).
+# It is used for the geometry packet and for the area model's height term only.
+focal_length_px = 1420.0
 
 # --------------------------------------------------------------------------
-# Realism. This is the "realistic" preset; `--realism none|friendly|realistic|
-# rc2021` swaps the whole table, and `--realism <file.toml>` loads a file with
-# exactly these keys at the top level. It is also settable at runtime through
-# `RealismConfig.custom` carrying an ER-Force `RealismConfigErForce`.
+# Realism. This is the `realistic` preset — now the *measured* 2026 preset, not
+# ER-Force's numbers. `--realism <name>` swaps the whole table:
+#
+#   none               no noise, no loss
+#   realistic          this table: pooled 2026 measurement (default)
+#   go26               German Open 2026 venue
+#   rc26               RoboCup 2026 venue
+#   erforce_friendly   ER-Force's own presets, kept for comparison and for
+#   erforce_realistic  clients that were tuned against ER-Force's simulator
+#   erforce_rc2021     (aliases: friendly, rc2021)
+#
+# `--realism <file.toml>` loads a file with exactly these keys at the top
+# level. It is also settable at runtime through `RealismConfig.custom` carrying
+# an ER-Force `RealismConfigErForce` (which covers the first 17 keys only).
 # --------------------------------------------------------------------------
 [realism]
-# Gaussian measurement noise.
-stddev_ball_p = 0.0014      # [m]
-stddev_robot_p = 0.0013     # [m]
-stddev_robot_phi = 0.01     # [rad]
-stddev_ball_area = 6.5      # [px]
+# Gaussian measurement noise, per camera per frame. These are *white* noise
+# only, measured after removing a 1 s linear trend (vision.md §3): 0.42 mm on a
+# static robot, 0.71 mm on a resting ball, 4.29 mrad on orientation. They are
+# an order of magnitude smaller than the calibration error below, which is the
+# headline result of the whole study (vision.md §5).
+stddev_ball_p = 0.0007      # [m]
+stddev_robot_p = 0.0005     # [m]
+stddev_robot_phi = 0.005    # [rad]
+stddev_ball_area = 3.3      # [px], 5.4 % of a 63 px ball
 # Ball occlusion behind robots, and the visible fraction below which the ball
-# is dropped for that camera.
+# is dropped for that camera. Real dribbled balls are detected 57 % of the time
+# versus 89 % free, a ratio of 0.64 (vision.md §6).
 enable_invisible_ball = true
 ball_visibility_threshold = 0.4
-# Half of the camera overlap band [m]: regions overlap by 2 * this.
-camera_overlap = 1.0
-# Spurious ball detections at robot dribblers [1/s/robot] (red break beams).
-dribbler_ball_detections = 0.05
+# Half of the camera overlap band [m]: regions overlap by 2 * this. The band
+# where both cameras really produce detections is 0.1-3.1 m wide depending on
+# y; 0.8 m is the p90 half-width (vision.md §2).
+camera_overlap = 0.8
+# Spurious ball detections at robot dribblers [1/s/robot]. This is a property
+# of the *vision configuration*, not of robots: 0.042-0.089 at the German Open
+# (no area filter possible) versus 0.0015-0.0063 at RoboCup 2026, a 60x split
+# (vision.md §6, §9.8). 0.02 is the pooled midpoint.
+dribbler_ball_detections = 0.02
 # Error injected into the *reported* camera calibration only [m]; the true
-# camera positions used for the ball projection stay correct.
-camera_position_error = 0.1
+# camera positions used for the ball projection stay correct. Not observable
+# from a log, so it is kept small and `object_position_offset` carries the
+# error a client can actually see (vision.md §8).
+camera_position_error = 0.02
 # Datagram loss on the robot control ports (applied in ssl-sim-net).
-robot_command_loss = 0.03
-robot_response_loss = 0.1
-# Per-camera, per-frame dropout probabilities.
-missing_ball_detections = 0.05
-missing_robot_detections = 0.02
-# Capture -> send delay [s] and t_sent - t_capture [s].
-vision_delay = 0.035
-vision_processing_time = 0.01
+robot_command_loss = 0.01
+robot_response_loss = 0.01
+# Per-camera, per-frame dropout probabilities. Measured with the tracker-free
+# prev/next estimator: 0.169 % for robots, 1.43 % for balls of which almost all
+# is occlusion — the unconditional ball dropout with no robot near is 0.5-0.7 %
+# (vision.md §4).
+missing_ball_detections = 0.007
+missing_robot_detections = 0.002
+# Capture -> send delay [s] and t_sent - t_capture [s]. The processing time is
+# directly measured (5.6-8.9 ms by venue, 7.26 ms pooled); the delay adds a
+# conventional 15 ms of exposure/readout and LAN hop that a log cannot show
+# (vision.md §1, §10).
+vision_delay = 0.022
+vision_processing_time = 0.0073
 # false switches the dribbler to perfect "glue" mode.
 simulate_dribbling = true
-# Fixed per-camera radial bias applied to every reported object [m].
+# --- static calibration error: the dominant vision error in real games ---
+# Two cameras place the same robot 20.3 mm apart on average (28.9 mrad in
+# orientation) while each camera's own per-frame noise is 0.4 mm. The error has
+# a constant part and a smooth spatially varying part of similar size
+# (vision.md §5, §9.5).
+#
+# Constant per-camera position offset [m], in a direction drawn once per camera
+# from the seed. RoboCup 2026 showed a 2.0-2.6 cm constant offset along x
+# between the two cameras; the German Open showed none (+-7 mm).
 object_position_offset = 0.02
+# Smooth per-camera position warp: standard deviation [m] over the field and
+# the wavelength [m] of the waves that make it. sigma 8-20 mm measured; the
+# German Open rig was the warped one (13-15 mm), RoboCup 2026 the offset one.
+calibration_warp_stddev = 0.012
+calibration_warp_length = 3.0
+# The same for orientation: a constant offset [rad] with a per-camera sign,
+# plus a spatially varying part. Cameras disagree by 25-32 mrad rms.
+calibration_orientation_offset = 0.02
+calibration_orientation_warp = 0.02
+# --- kick imperfections (dynamics.md) ---
+# Kick direction error [rad] and chip launch elevation error [rad], one draw
+# per kick; and the multiplicative speed error (std of the factor).
+kick_direction_stddev = 0.04363323129985824   # 2.5 deg
+chip_angle_stddev = 0.10471975511965978       # 6.0 deg
+kick_speed_factor_stddev = 0.1
 # Fixed delay on incoming robot commands [s]. NOT IMPLEMENTED YET: the net
 # layer applies commands at the next substep regardless of this value.
 command_delay = 0.0
