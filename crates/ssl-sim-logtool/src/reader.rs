@@ -23,6 +23,7 @@ pub enum Record {
     /// Tracker (autoref / GC ball tracker) packet.
     Tracker(tracked::TrackerWrapperPacket),
     /// Anything else (legacy vision, index, unknown).
+    #[allow(dead_code)]
     Other {
         /// Raw type id.
         kind: i32,
@@ -66,7 +67,10 @@ impl LogReader {
         let mut header = [0u8; 16];
         input.read_exact(&mut header).context("read log header")?;
         if &header[..12] != b"SSL_LOG_FILE" {
-            bail!("not an SSL log file: header {:?}", String::from_utf8_lossy(&header[..12]));
+            bail!(
+                "not an SSL log file: header {:?}",
+                String::from_utf8_lossy(&header[..12])
+            );
         }
         let version = i32::from_be_bytes(header[12..16].try_into().unwrap());
         if version != 1 {
@@ -96,31 +100,45 @@ impl LogReader {
         }
         self.buf.clear();
         self.buf.resize(size as usize, 0);
-        self.input.read_exact(&mut self.buf).context("read record payload")?;
+        self.input
+            .read_exact(&mut self.buf)
+            .context("read record payload")?;
         self.count += 1;
         let record = match kind {
             4 => match sim::SslWrapperPacket::decode(self.buf.as_slice()) {
                 Ok(p) => Record::Vision(p),
                 Err(_) => {
                     self.decode_errors += 1;
-                    Record::Other { kind, len: self.buf.len() }
+                    Record::Other {
+                        kind,
+                        len: self.buf.len(),
+                    }
                 }
             },
             3 => match gc::Referee::decode(self.buf.as_slice()) {
                 Ok(r) => Record::Referee(r),
                 Err(_) => {
                     self.decode_errors += 1;
-                    Record::Other { kind, len: self.buf.len() }
+                    Record::Other {
+                        kind,
+                        len: self.buf.len(),
+                    }
                 }
             },
             5 => match tracked::TrackerWrapperPacket::decode(self.buf.as_slice()) {
                 Ok(t) => Record::Tracker(t),
                 Err(_) => {
                     self.decode_errors += 1;
-                    Record::Other { kind, len: self.buf.len() }
+                    Record::Other {
+                        kind,
+                        len: self.buf.len(),
+                    }
                 }
             },
-            _ => Record::Other { kind, len: self.buf.len() },
+            _ => Record::Other {
+                kind,
+                len: self.buf.len(),
+            },
         };
         Ok(Some(Entry { time_ns, record }))
     }

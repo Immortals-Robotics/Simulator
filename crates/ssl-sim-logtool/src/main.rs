@@ -17,7 +17,10 @@ use clap::{Parser, Subcommand};
 use reader::{LogReader, Record};
 
 #[derive(Debug, Parser)]
-#[command(name = "ssl-logtool", about = "SSL game log analysis for simulator calibration")]
+#[command(
+    name = "ssl-logtool",
+    about = "SSL game log analysis for simulator calibration"
+)]
 struct Args {
     #[command(subcommand)]
     command: Command,
@@ -66,7 +69,9 @@ fn inventory(path: &std::path::Path, limit: u64) -> Result<()> {
         let name = match &entry.record {
             Record::Vision(p) => {
                 if let Some(d) = &p.detection {
-                    let e = per_camera.entry(d.camera_id).or_insert((0, d.t_capture, d.t_capture));
+                    let e = per_camera
+                        .entry(d.camera_id)
+                        .or_insert((0, d.t_capture, d.t_capture));
                     e.0 += 1;
                     e.2 = d.t_capture;
                 }
@@ -89,11 +94,18 @@ fn inventory(path: &std::path::Path, limit: u64) -> Result<()> {
     }
     let span = (last_ns - first_ns.unwrap_or(last_ns)) as f64 * 1e-9;
     println!("{}", path.display());
-    println!("  records {} span {:.1} s decode_errors {} kinds {:?}", reader.count, span, reader.decode_errors, kinds);
+    println!(
+        "  records {} span {:.1} s decode_errors {} kinds {:?}",
+        reader.count, span, reader.decode_errors, kinds
+    );
     println!("  geometry packets {}", geometry);
     for (cam, (n, t0, t1)) in &per_camera {
         let dt = t1 - t0;
-        let hz = if dt > 0.0 { (*n as f64 - 1.0) / dt } else { 0.0 };
+        let hz = if dt > 0.0 {
+            (*n as f64 - 1.0) / dt
+        } else {
+            0.0
+        };
         println!("  camera {cam}: {n} frames, {hz:.2} Hz over {dt:.1} s");
     }
     println!("  referee commands {:?}", ref_commands);
