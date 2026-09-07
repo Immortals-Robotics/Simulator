@@ -328,23 +328,24 @@ mod tests {
             t += dt;
         }
         assert!((sp.vx - 3.0).abs() < 1e-9 && (sp.omega - 10.0).abs() < 1e-9);
-        // time to reach 3 m/s at 4 m/s^2 is 0.75 s
+        // time to reach 3 m/s is 3 / acc_speedup (0.857 s at the measured 3.5 m/s^2)
         let mut sp2 = LocalTwist::default();
         let mut n = 0;
         while (sp2.vx - 3.0).abs() > 1e-9 {
             sp2 = limit_setpoint(sp2, target, &specs, dt);
             n += 1;
         }
-        assert!((n as f64 * dt - 0.75).abs() < 2.0 * dt);
+        let expected = 3.0 / specs.limits.acc_speedup_absolute_max;
+        assert!((n as f64 * dt - expected).abs() < 2.0 * dt);
         // braking uses the brake limit
         let next = limit_setpoint(sp, Some(LocalTwist::default()), &specs, dt);
         assert!((sp.vx - next.vx - specs.limits.acc_brake_absolute_max * dt).abs() < 1e-9);
         // velocity clamp
         let fast = limit_setpoint(
             LocalTwist {
-                vx: 3.4,
+                vx: specs.limits.vel_absolute_max - 0.1,
                 vy: 0.0,
-                omega: 19.99,
+                omega: specs.limits.vel_angular_max - 0.01,
             },
             Some(LocalTwist {
                 vx: 10.0,
@@ -409,13 +410,15 @@ mod tests {
             },
             0.6,
         );
-        let at_300 = hist[299];
+        // the limiter alone needs 1 / acc_speedup (0.286 s); the wheels lag a little
+        let settle = 1.0 / RobotSpecs::default().limits.acc_speedup_absolute_max + 0.1;
+        let at_settle = hist[(settle / 0.001) as usize];
         assert!(
-            (at_300.vx - 1.0).abs() <= 0.02,
-            "vx at 0.3 s = {}",
-            at_300.vx
+            (at_settle.vx - 1.0).abs() <= 0.02,
+            "vx at {settle} s = {}",
+            at_settle.vx
         );
-        assert!(at_300.vy.abs() < 0.01 && at_300.omega.abs() < 0.05);
+        assert!(at_settle.vy.abs() < 0.01 && at_settle.omega.abs() < 0.05);
         // never overshoots meaningfully and is monotone non-decreasing
         let mut prev = 0.0;
         for h in &hist {

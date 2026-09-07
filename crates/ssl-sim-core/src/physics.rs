@@ -9,6 +9,7 @@ use crate::ball::{Ball, BallTrajectory};
 use crate::collision;
 use crate::field::{FieldGeometry, WallSegment};
 use crate::params::SimConfig;
+use crate::rng::Rngs;
 use crate::robot::{dribbler, drive, kicker, Robot};
 use crate::types::{Event, RobotId, SimTime, Vec2};
 
@@ -62,17 +63,21 @@ pub fn step_robots(
     collision::resolve_robot_contacts(robots, field, walls, &config.contact, events);
 }
 
-/// Ball phase: kicks (`kicker::try_kick` for every robot whose command asks),
-/// dribbler forces, `by_force` mover, then the collision sweep loop (advance
-/// to each contact by time of impact, resolve, repeat up to 4 times), then the
-/// free advance of the remaining time. Updates every robot's `ball_contact`.
-/// Emits `Kick`, `DribblerSlip`, `Goal` and `BallLeftField` events.
+/// Ball phase: kicks (`kicker::try_kick` for every robot whose command asks,
+/// with the realism kick errors drawn from `rngs.physics`), dribbler forces,
+/// `by_force` mover, then the collision sweep loop (advance to each contact
+/// by time of impact, resolve, repeat up to 4 times), then the free advance
+/// of the remaining time. A ball whose centre is over a robot top uses that
+/// top as its floor (`collision::support_height`). Updates every robot's
+/// `ball_contact`. Emits `Kick`, `DribblerSlip`, `Goal` and `BallLeftField`
+/// events.
 pub fn step_ball(
     ball: &mut Ball,
     robots: &mut BTreeMap<RobotId, Robot>,
     field: &FieldGeometry,
     walls: &[WallSegment],
     config: &SimConfig,
+    rngs: &mut Rngs,
     events: &mut Vec<Event>,
 ) {
     let dt = config.substep;
@@ -83,7 +88,13 @@ pub fn step_ball(
     let mut kicked_by: Option<RobotId> = None;
     for robot in robots.values_mut() {
         if robot.command.kick_speed.is_some_and(|s| s > 0.0) && robot.kicker.charged {
-            if let Some(ev) = kicker::try_kick(robot, &mut ball.state, params) {
+            if let Some(ev) = kicker::try_kick(
+                robot,
+                &mut ball.state,
+                params,
+                &config.realism,
+                &mut rngs.physics,
+            ) {
                 events.push(ev);
                 robot.dribbler.holding = false;
                 kicked_by = Some(robot.id);
@@ -139,26 +150,24 @@ pub fn step_ball(
             break;
         };
         if contact.time > 0.0 {
-            let traj = BallTrajectory::from_state(&ball.state, params);
+            let floor = collision::support_height(&ball.state, robots);
+            let traj = BallTrajectory::from_state_on(&ball.state, params, floor);
             ball.state = traj.state_at(contact.time);
             remaining -= contact.time;
         }
         let impulse =
             collision::resolve_ball_contact(&mut ball.state, &contact, params, &config.contact);
-        let hit_robot = match contact.surface {
-            collision::Surface::RobotHull(id) | collision::Surface::KickerFace(id) => Some(id),
-            _ => None,
-        };
-        if let Some(robot) = hit_robot.and_then(|id| robots.get_mut(&id)) {
+        if let Some(robot) = contact.surface.robot().and_then(|id| robots.get_mut(&id)) {
             let j = Vec2::new(impulse.x, impulse.y);
-            let contact_point = ball.state.pos_xy() - contact.normal * params.radius;
+            let contact_point = ball.state.pos_xy() - contact.normal_xy() * params.radius;
             let r = contact_point - robot.pos;
             robot.vel += j / robot.specs.mass.max(1e-6);
             robot.omega += (r.x * j.y - r.y * j.x) / robot.specs.inertia().max(1e-9);
         }
     }
     if remaining > 0.0 {
-        ball.advance(remaining, params);
+        let floor = collision::support_height(&ball.state, robots);
+        ball.advance_on(remaining, params, floor);
     }
 
     // 5. Feedback and events.
@@ -188,11 +197,31 @@ pub fn step_ball(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::params::RobotSpecs;
+    use crate::params::{Realism, RobotSpecs};
     use crate::types::{BallState, MoveCommand, RobotCommand, Team, Vec3};
 
+    /// Default config with the exact (noise-free) kicker so tests are analytic.
     fn config() -> SimConfig {
-        SimConfig::default()
+        SimConfig {
+            realism: Realism::none(),
+            ..SimConfig::default()
+        }
+    }
+
+    fn rngs() -> Rngs {
+        Rngs::from_seed(1)
+    }
+
+    /// `step_ball` with a throwaway RNG.
+    fn step(
+        ball: &mut Ball,
+        robots: &mut BTreeMap<RobotId, Robot>,
+        field: &FieldGeometry,
+        walls: &[WallSegment],
+        cfg: &SimConfig,
+        events: &mut Vec<Event>,
+    ) {
+        step_ball(ball, robots, field, walls, cfg, &mut rngs(), events);
     }
 
     /// A large field so that the test balls never leave it (goal tests need
@@ -248,7 +277,7 @@ mod tests {
         let mut events = Vec::new();
         let mut min_dist_to_wall = f64::MAX;
         for _ in 0..200 {
-            step_ball(&mut ball, &mut robots, &field, &walls, &cfg, &mut events);
+            step(&mut ball, &mut robots, &field, &walls, &cfg, &mut events);
             min_dist_to_wall = min_dist_to_wall.min(6.3 - ball.state.pos.x);
             assert!(ball.state.pos.x <= 6.3 - cfg.ball.radius + 1e-9);
         }
@@ -284,7 +313,7 @@ mod tests {
             ),
         );
         for _ in 0..2000 {
-            step_ball(&mut chip, &mut robots, &field, &walls, &cfg, &mut events);
+            step(&mut chip, &mut robots, &field, &walls, &cfg, &mut events);
         }
         assert!(
             chip.state.pos.x > 2.5,
@@ -296,7 +325,7 @@ mod tests {
             Vec3::new(3.0, 0.0, 0.0),
         );
         for _ in 0..2000 {
-            step_ball(&mut flat, &mut robots, &field, &walls, &cfg, &mut events);
+            step(&mut flat, &mut robots, &field, &walls, &cfg, &mut events);
         }
         assert!(flat.state.pos.x < 1.5 - cfg.ball.radius + 1e-9);
         assert!(flat.state.vel.x <= 0.0);
@@ -317,7 +346,7 @@ mod tests {
         let mut events = Vec::new();
         let mut contact_seen = false;
         for _ in 0..300 {
-            step_ball(&mut ball, &mut robots, &field, &[], &cfg, &mut events);
+            step(&mut ball, &mut robots, &field, &[], &cfg, &mut events);
             contact_seen |= robots[&RobotId::new(Team::Blue, 0)].ball_contact;
         }
         assert!(contact_seen);
@@ -362,7 +391,10 @@ mod tests {
         let a = &robots[&RobotId::new(Team::Blue, 0)];
         let b = &robots[&RobotId::new(Team::Blue, 1)];
         assert!(a.dribbler.active && (a.dribbler.fraction - 0.5).abs() < 1e-12);
-        assert!((b.pos - a.pos).length() >= 0.18 - 1e-6);
+        // face to face: the flat chords meet at 2 * center_to_dribbler
+        let c2d = a.specs.center_to_dribbler;
+        assert!((b.pos - a.pos).length() >= 2.0 * c2d - 1e-6);
+        assert!((b.pos - a.pos).length() < 2.0 * c2d + 0.002);
         assert!(b.pos.x > 0.6, "pushed robot moved: {}", b.pos.x);
         assert!(events
             .iter()
@@ -407,7 +439,7 @@ mod tests {
                 .unwrap()
                 .set_command(cmd, now);
             step_robots(&mut robots, &field, &[], &cfg, now, &mut events);
-            step_ball(&mut ball, &mut robots, &field, &[], &cfg, &mut events);
+            step(&mut ball, &mut robots, &field, &[], &cfg, &mut events);
             now = now.plus(cfg.substep_time());
         }
         let r = &robots[&RobotId::new(Team::Blue, 0)];
@@ -421,6 +453,225 @@ mod tests {
     }
 
     #[test]
+    fn chord_contact_stops_facing_robots_at_twice_center_to_dribbler() {
+        // Two robots driving into each other face to face stop chord on chord;
+        // with the discs-only option they stop at 2 R.
+        let run = |chord: bool| -> f64 {
+            let mut cfg = config();
+            cfg.contact.robot_hull_chord_contacts = chord;
+            let field = big_field();
+            let mut robots: BTreeMap<RobotId, Robot> = BTreeMap::new();
+            let forward = RobotCommand {
+                movement: Some(MoveCommand::LocalVelocity {
+                    forward: 0.5,
+                    left: 0.0,
+                    angular: 0.0,
+                }),
+                ..Default::default()
+            };
+            let a = robot(0, Vec2::ZERO, 0.0);
+            let b = robot(1, Vec2::new(0.4, 0.0), std::f64::consts::PI);
+            robots.insert(a.id, a);
+            robots.insert(b.id, b);
+            let mut events = Vec::new();
+            let mut now = SimTime::ZERO;
+            for _ in 0..1500 {
+                for id in [RobotId::new(Team::Blue, 0), RobotId::new(Team::Blue, 1)] {
+                    robots.get_mut(&id).unwrap().set_command(forward, now);
+                }
+                step_robots(&mut robots, &field, &[], &cfg, now, &mut events);
+                now = now.plus(cfg.substep_time());
+            }
+            let a = &robots[&RobotId::new(Team::Blue, 0)];
+            let b = &robots[&RobotId::new(Team::Blue, 1)];
+            assert!(events
+                .iter()
+                .any(|e| matches!(e, Event::RobotCollision { .. })));
+            (b.pos - a.pos).length()
+        };
+        let specs = RobotSpecs::default();
+        let d = run(true);
+        assert!(
+            (d - 2.0 * specs.center_to_dribbler).abs() < 0.002,
+            "chord: {d}"
+        );
+        let d = run(false);
+        assert!((d - 2.0 * specs.radius).abs() < 0.002, "disc: {d}");
+    }
+
+    #[test]
+    fn ball_lands_on_robot_top_bounces_rolls_off_and_falls() {
+        let cfg = config();
+        let field = big_field();
+        let mut robots: BTreeMap<RobotId, Robot> = BTreeMap::new();
+        let r = robot(0, Vec2::ZERO, 0.0);
+        let h = r.specs.height;
+        let hull_r = r.specs.radius;
+        robots.insert(r.id, r);
+        let rb = cfg.ball.radius;
+        let drop = 0.25;
+        let mut ball = ball_with(
+            Vec3::new(-0.02, 0.0, h + rb + drop),
+            Vec3::new(0.0, 0.0, 0.0),
+        );
+        let mut events = Vec::new();
+        // Phase 1: fall and first bounce on the top with the configured damping.
+        let mut first_bounce: Option<f64> = None;
+        let mut step_no = 0;
+        while first_bounce.is_none() && step_no < 1000 {
+            let vz_before = ball.state.vel.z;
+            step(&mut ball, &mut robots, &field, &[], &cfg, &mut events);
+            step_no += 1;
+            if ball.state.vel.z > 0.0 {
+                let v_in = (2.0 * crate::GRAVITY * drop).sqrt();
+                assert!(vz_before < 0.0);
+                let expected = v_in * (1.0 - cfg.contact.ball_robot_top_normal);
+                assert!(
+                    (ball.state.vel.z - expected).abs() < 0.03,
+                    "bounce vz {} vs {expected}",
+                    ball.state.vel.z
+                );
+                first_bounce = Some(ball.state.vel.z);
+            }
+            assert!(ball.state.pos.z >= h + rb - 1e-9, "sank into the top");
+        }
+        assert!(first_bounce.is_some(), "never bounced");
+        // Phase 2: it comes to rest on the top (its floor is the robot).
+        let mut rested = false;
+        for _ in 0..2000 {
+            step(&mut ball, &mut robots, &field, &[], &cfg, &mut events);
+            assert!(ball.state.pos.z >= h + rb - 1e-9);
+            if ball.state.pos.z == h + rb && ball.state.vel.z == 0.0 {
+                rested = true;
+                break;
+            }
+        }
+        assert!(rested, "did not settle on the top: {:?}", ball.state);
+        assert!(ball.state.pos_xy().length() < hull_r);
+        // Phase 3: push it toward the edge; it rolls on the top, leaves the
+        // footprint, falls, and ends on the carpet outside the hull.
+        ball.state.vel = Vec3::new(0.6, 0.0, 0.0);
+        ball.state.spin = ball.state.vel_xy();
+        let mut rolled_on_top = false;
+        let mut fell = false;
+        let mut max_speed_after_edge: f64 = 0.0;
+        for _ in 0..4000 {
+            let before = ball.state;
+            step(&mut ball, &mut robots, &field, &[], &cfg, &mut events);
+            let inside = ball.state.pos_xy().length() < hull_r;
+            if inside && ball.state.pos.z == h + rb && ball.state.vel.z == 0.0 {
+                rolled_on_top = true;
+                assert!(
+                    ball.state.vel.x < before.vel.x + 1e-12,
+                    "no acceleration on the top"
+                );
+            }
+            if !inside {
+                fell = true;
+                assert!(ball.state.pos.z <= h + rb + 1e-9);
+                max_speed_after_edge = max_speed_after_edge.max(ball.state.vel.length());
+            }
+            if ball.state.pos.z == rb && ball.state.vel.z == 0.0 && !inside {
+                break;
+            }
+        }
+        assert!(rolled_on_top && fell);
+        assert_eq!(
+            ball.state.pos.z, rb,
+            "did not reach the carpet: {:?}",
+            ball.state
+        );
+        assert!(ball.state.pos_xy().length() > hull_r + rb - 1e-9);
+        // the drop converts height into speed: at most sqrt(v^2 + 2 g h) (no energy gain)
+        let bound = (0.6f64 * 0.6 + 2.0 * crate::GRAVITY * h).sqrt();
+        assert!(
+            max_speed_after_edge <= bound + 1e-6,
+            "{max_speed_after_edge} > {bound}"
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn ball_on_a_moving_robot_top_picks_up_surface_velocity_on_landing() {
+        let cfg = config();
+        let field = big_field();
+        let mut robots: BTreeMap<RobotId, Robot> = BTreeMap::new();
+        let mut r = robot(0, Vec2::ZERO, 0.0);
+        r.vel = Vec2::new(1.0, 0.0);
+        let h = r.specs.height;
+        robots.insert(r.id, r);
+        let rb = cfg.ball.radius;
+        let mut ball = ball_with(Vec3::new(0.0, 0.0, h + rb), Vec3::new(0.0, 0.0, -1.0));
+        let mut events = Vec::new();
+        step(&mut ball, &mut robots, &field, &[], &cfg, &mut events);
+        let kt = cfg.contact.ball_robot_top_tangent;
+        assert!((ball.state.vel.x - kt * 1.0).abs() < 1e-9);
+        // bounce, minus gravity over the rest of the substep
+        let vz = 1.0 * (1.0 - cfg.contact.ball_robot_top_normal);
+        assert!((ball.state.vel.z - vz).abs() < crate::GRAVITY * cfg.substep + 1e-9);
+        assert!(ball.state.vel.z > 0.0);
+        // the robot felt the vertical impulse only as a horizontal drag
+        let r = &robots[&RobotId::new(Team::Blue, 0)];
+        assert!(r.vel.x < 1.0);
+    }
+
+    #[test]
+    fn slow_ball_at_the_face_of_a_dribbling_robot_is_captured() {
+        // A ball arriving at 1-2 m/s at the kicker face of a robot with the
+        // dribbler on ends up held at the seat (dynamics.md §6: 48 % of face
+        // contacts are captures; §10.5).
+        for v_in in [1.0, 1.5, 2.0] {
+            let cfg = config();
+            assert_eq!(cfg.contact.ball_kicker_normal, 0.8);
+            let field = big_field();
+            let mut robots: BTreeMap<RobotId, Robot> = BTreeMap::new();
+            let mut a = robot(0, Vec2::ZERO, 0.0);
+            assert_eq!(a.specs.dribbler.hold_accel, 3.0);
+            assert_eq!(a.specs.dribbler.seat_depth, 0.0);
+            assert_eq!(a.specs.shoot_radius, 0.0965);
+            a.set_command(
+                RobotCommand {
+                    movement: None,
+                    dribbler_rpm: Some(10000.0),
+                    ..Default::default()
+                },
+                SimTime::ZERO,
+            );
+            robots.insert(a.id, a);
+            let mut ball = ball_with(
+                Vec3::new(0.4, 0.0, cfg.ball.radius),
+                Vec3::new(-v_in, 0.0, 0.0),
+            );
+            ball.state.spin = ball.state.vel_xy();
+            let mut events = Vec::new();
+            let mut now = SimTime::ZERO;
+            for _ in 0..1500 {
+                let cmd = robots[&RobotId::new(Team::Blue, 0)].command;
+                robots
+                    .get_mut(&RobotId::new(Team::Blue, 0))
+                    .unwrap()
+                    .set_command(cmd, now);
+                step_robots(&mut robots, &field, &[], &cfg, now, &mut events);
+                step(&mut ball, &mut robots, &field, &[], &cfg, &mut events);
+                now = now.plus(cfg.substep_time());
+            }
+            let r = &robots[&RobotId::new(Team::Blue, 0)];
+            assert!(
+                r.dribbler.holding,
+                "v_in={v_in}: ball not held, {:?}",
+                ball.state
+            );
+            assert!(r.ball_contact);
+            assert!(
+                (ball.state.pos_xy() - dribbler::seat_point(r)).length() < 0.003,
+                "v_in={v_in}: ball at {:?}",
+                ball.state.pos
+            );
+            assert!(ball.state.vel_xy().length() < 0.05);
+        }
+    }
+
+    #[test]
     fn by_force_moves_ball_to_target() {
         let cfg = config();
         let field = big_field();
@@ -429,7 +680,7 @@ mod tests {
         ball.force_target = Some(Vec3::new(1.0, 0.5, 0.0));
         let mut events = Vec::new();
         for _ in 0..3000 {
-            step_ball(&mut ball, &mut robots, &field, &[], &cfg, &mut events);
+            step(&mut ball, &mut robots, &field, &[], &cfg, &mut events);
         }
         assert!(
             (ball.state.pos_xy() - Vec2::new(1.0, 0.5)).length() < 0.02,
@@ -455,7 +706,7 @@ mod tests {
         );
         let mut events = Vec::new();
         for _ in 0..300 {
-            step_ball(&mut ball, &mut robots, &field, &[], &cfg, &mut events);
+            step(&mut ball, &mut robots, &field, &[], &cfg, &mut events);
         }
         assert!(ball.state.pos.x > 1.0);
         assert_eq!(

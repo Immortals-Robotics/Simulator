@@ -6,12 +6,14 @@
 //!
 //! Model: the seated point is `shoot_radius` along the heading (default
 //! `center_to_dribbler + ball_radius - seat_depth`, i.e. the ball nests
-//! `seat_depth` into the kicker face plane). A critically damped PD with a
+//! `seat_depth` into the kicker face plane; measured `seat_depth = 0`, the
+//! ball touches the face). A critically damped PD with a
 //! 20 ms horizon computes the acceleration needed to bring the ball to the
 //! seat with the surface velocity of the seat. The component that *pushes*
 //! the ball forward (along the heading) is provided by the rigid kicker face
 //! and is unlimited; the *pulling* component (backward) and the lateral
-//! component are traction and are limited to `hold_accel * fraction`. When
+//! component are traction and are limited to `hold_accel_actual * fraction`
+//! (`Robot::hold_accel_actual`, the per-robot draw around `hold_accel`). When
 //! the ball was held and the traction demand exceeds the budget, the ball
 //! slips: only the budget is applied and `holding` drops. Back-spin is set
 //! to `surface_vel - heading * min(fraction * omega_max * roller_radius,
@@ -146,7 +148,7 @@ pub fn apply(
     // Forward push is rigid (kicker face); pull and lateral are traction.
     let push = local.x.max(0.0);
     let traction = Vec2::new(local.x.min(0.0), local.y);
-    let budget = specs.dribbler.hold_accel * state.fraction.clamp(0.0, 1.0);
+    let budget = robot.hold_accel_actual.max(0.0) * state.fraction.clamp(0.0, 1.0);
     let need = traction.length();
 
     let (applied_traction, holding, slipped) =
@@ -260,16 +262,16 @@ mod tests {
     }
 
     #[test]
-    fn holds_at_2_and_drops_at_6() {
-        // pulling (robot reversing)
+    fn holds_at_2_and_drops_at_5() {
+        // pulling (robot reversing); the mean budget is 3 m/s^2
         let (holding, slipped) = run(Vec2::new(-2.0, 0.0), 0.5);
         assert!(holding && !slipped);
-        let (holding, slipped) = run(Vec2::new(-6.0, 0.0), 0.5);
+        let (holding, slipped) = run(Vec2::new(-5.0, 0.0), 0.5);
         assert!(!holding && slipped);
         // lateral
         let (holding, slipped) = run(Vec2::new(0.0, 2.0), 0.5);
         assert!(holding && !slipped);
-        let (holding, slipped) = run(Vec2::new(0.0, 6.0), 0.5);
+        let (holding, slipped) = run(Vec2::new(0.0, 5.0), 0.5);
         assert!(!holding && slipped);
         // pushing forward is rigid: no slip even at 10 m/s^2
         let (holding, slipped) = run(Vec2::new(10.0, 0.0), 0.3);
@@ -313,6 +315,7 @@ mod tests {
         let out = apply(&mut r, &mut ball, &params, 0.001);
         assert!(out.slipped && !out.holding);
         let a = ball.vel_xy() / 0.001;
+        assert_eq!(r.hold_accel_actual, r.specs.dribbler.hold_accel);
         assert!((a.length() - r.specs.dribbler.hold_accel).abs() < 1e-6);
         assert!((out.reaction_force + a * params.mass).length() < 1e-9);
         // half speed: half budget
@@ -322,7 +325,41 @@ mod tests {
         let mut ball = seated_ball(&r, &params);
         ball.vel = Vec3::ZERO;
         apply(&mut r, &mut ball, &params, 0.001);
-        assert!((ball.vel_xy().length() / 0.001 - 2.0).abs() < 1e-6);
+        let half = 0.5 * r.specs.dribbler.hold_accel;
+        assert!((ball.vel_xy().length() / 0.001 - half).abs() < 1e-6);
+        // the per-robot draw is what limits the pull, not the spec mean
+        let mut r = robot();
+        r.hold_accel_actual = 1.5;
+        r.dribbler.holding = true;
+        r.vel = Vec2::new(-1.0, 0.0);
+        let mut ball = seated_ball(&r, &params);
+        ball.vel = Vec3::ZERO;
+        let out = apply(&mut r, &mut ball, &params, 0.001);
+        assert!(out.slipped);
+        assert!((ball.vel_xy().length() / 0.001 - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn per_robot_budget_decides_the_slip_threshold() {
+        // A generous robot holds at 4 m/s^2 of pull; a weak one drops the ball.
+        let run_with = |hold: f64| {
+            let params = BallParams::default();
+            let mut r = robot();
+            r.hold_accel_actual = hold;
+            let mut ball = seated_ball(&r, &params);
+            let dt = 0.001;
+            let mut slipped = false;
+            for _ in 0..500 {
+                r.vel += Vec2::new(-4.0, 0.0) * dt;
+                r.pos += r.vel * dt;
+                let out = apply(&mut r, &mut ball, &params, dt);
+                slipped |= out.slipped;
+                ball.pos += ball.vel * dt;
+            }
+            slipped
+        };
+        assert!(!run_with(5.0));
+        assert!(run_with(1.5));
     }
 
     #[test]

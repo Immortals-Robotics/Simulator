@@ -124,12 +124,14 @@ advertised verbatim in the geometry packet):
 |---|---|---|
 | radius | 0.0215 m | |
 | mass | 0.046 kg | |
-| acc_slide | −3.0 m/s² | Sumatra −3.0, ER-Force −3.9, real field measurements −2.5…−3.4 |
-| acc_roll | −0.30 m/s² | Sumatra −0.26…−0.45, ER-Force −0.35 |
-| inertia_distribution p | 0.5 | ⇒ published k_switch = 1/(1+p) = 0.667 |
-| chip_damping_xy_first_hop | 0.75 | TIGERs field files |
-| chip_damping_xy_other_hops | 0.95 | |
-| chip_damping_z | 0.50 | |
+| acc_slide | −3.3 m/s² | fitted from 2026 logs (n 490); Sumatra −3.0, ER-Force −3.9 |
+| acc_roll | −0.22 m/s² at v = 0 | rolling deceleration grows with speed, see below |
+| roll_speed_coefficient | 0.045 s⁻¹ | `a(v) = acc_roll − coeff·v`; −0.29 m/s² at 1.5 m/s (advertised) |
+| inertia_distribution p | 0.5 | fitted k_switch 0.659 ⇒ p 0.52; published k_switch = 1/(1+p) |
+| chip_damping_xy_first_hop | 0.70 | fitted (n 67 + 149) |
+| chip_damping_xy_other_hops | 0.87 | fitted (n 47) |
+| chip_damping_z | 0.46 | first bounce |
+| chip_damping_z_other_hops | 0.40 | later bounces |
 | min_hop_height | 0.01 m | below this the ball is grounded |
 | rest_speed | 0.01 m/s | snap to rest |
 
@@ -137,7 +139,13 @@ advertised verbatim in the geometry packet):
 slip `c = v0 − s0·r`; if `|c| < ε` the ball rolls with `a = v̂·acc_roll`;
 otherwise it slides with `a = ĉ·acc_slide`, spin accelerates by
 `a/(r·p)`, and the switch happens after `t_sw = |(s0·r − v0)·p/(1+p)| / |a|`
-(component along the dominant axis), then rolls. Rest time is analytic.
+(component along the dominant axis), then rolls. The rolling phase uses the
+speed-dependent law `a(v) = a0 + b·v` (a0 = |acc_roll|, b =
+roll_speed_coefficient), which keeps a closed form: `v(t) = (v0 + a0/b)·e^{−bt}
+− a0/b`, analytic `s(t)`, rest time `ln(1 + b·v0/a0)/b`, degrading to the
+constant-deceleration formulas at b = 0. Rest time is analytic either way.
+Venue presets (`BallParams::preset`): `go26`, `rc26`, `erforce`, `tigers`,
+`grsim`.
 Implemented as `BallTrajectory::from_state(state, params)` with
 `state_at(t)`, `time_by_distance(d)`, `time_by_velocity(v)`, and the chip
 inverses (`vel_for_distance`, `vel_for_touchdown(n, d)`, `vel_for_height`).
@@ -180,12 +188,12 @@ Per-robot `RobotSpecs` (all fields settable live from the protocol):
 | inertia_z | ½·m·r² ≈ 0.0101 kg·m² | derived unless overridden |
 | center_to_dribbler | 0.075 m | Sumatra physics value; mouth half-angle acos(c2d/r) |
 | dribbler_width | 0.07 m | ER-Force `RobotSpecErForce` |
-| shoot_radius | 0.0885 m | seated ball centre = c2d + r_ball − seat_depth (in front of the solid chord) |
+| shoot_radius | 0.0965 m | seated ball centre = c2d + r_ball (measured 0.097–0.099 m; seat_depth 0) |
 | max_linear_kick_speed | 6.5 m/s | ER-Force gen-2020 |
 | max_chip_kick_speed | 5.5 m/s | |
-| limits.vel_absolute_max / vel_angular_max | 3.5 m/s / 20 rad/s | |
-| limits.acc_speedup_absolute_max / brake | 4.0 / 6.0 m/s² | |
-| limits.acc_speedup_angular_max / brake | 50 / 50 rad/s² | |
+| limits.vel_absolute_max / vel_angular_max | 3.0 m/s / 12 rad/s | fitted 2026 (p99 2.5–2.9, ω max 9–15); presets tigers/erforce/kiks/fast/grsim |
+| limits.acc_speedup_absolute_max / brake | 3.5 / 5.0 m/s² | fitted (p95 3.2–4.2 / 4–6) |
+| limits.acc_speedup_angular_max / brake | 40 / 40 rad/s² | |
 | wheel_angles | (60,135,225,300)° CCW | grSim layout |
 | wheel_radius | 0.027 m | grSim ini |
 | motor.max_wheel_speed | derived from vel_absolute_max·1.3 | |
@@ -196,12 +204,16 @@ Per-robot `RobotSpecs` (all fields settable live from the protocol):
 | kicker.charge_time | 0.1 s (configurable; realistic ≈ 1–2 s) | ER-Force |
 | kicker.max_ball_height | 0.05 m | ER-Force |
 | dribbler.max_speed_rpm | 10 000 | normalisation only |
-| dribbler.hold_accel | 4.0 m/s² at full speed | traction budget |
+| dribbler.hold_accel | 3.0 ± 1.0 m/s² (per-robot draw, min 1.5) | fitted loss threshold (n 174), 80 % of losses while braking |
 
-**Hull**: disc of `radius` with a flat front chord at distance
-`center_to_dribbler`; the chord width follows. Used for ball contact (2D, with
-height gate) and for robot–robot contact (disc only; the chord is ignored
-between robots, as every simulator does).
+**Hull**: a cut cylinder — disc of `radius` with a flat front chord at
+distance `center_to_dribbler`, height `height`. Ball contacts: sideways
+against the round hull or the chord (height-gated), landing on the flat top
+(vertical contact with `ball_robot_top_normal`/`_tangent`, then the top acts
+as the floor until the ball rolls off), and the rim band within one ball
+radius of the top edge (tilted normal, no tunnelling). Robot–robot contacts
+use the chord too when `robot_hull_chord_contacts` (separating-axis test on
+the cut discs), so face-to-face robots stop at 2·c2d instead of 2·radius.
 
 **Drive, `wheels` mode (default)**: robot is a 2D rigid body `(x, y, θ, vx,
 vy, ω)` with mass and `inertia_z`. Each substep:
@@ -237,7 +249,12 @@ the ball's incoming normal component; `speed` clamped to `[0.05,
 max_linear|chip]`, `α` = `kick_angle` degrees (any value accepted; 0 straight,
 45 typical chip). Spin reset to zero. Discharge, recharge after
 `charge_time`. Dribbler is released for that substep. Feedback gets a
-`kick` event for the legacy `Robots_Status`.
+`kick` event for the legacy `Robots_Status`. Realism adds per-kick errors
+drawn from the seeded physics stream: direction N(0, `kick_direction_stddev`,
+2.5° measured), chip elevation N(0, `chip_angle_stddev`, 6°), speed factor
+1 + N(0, `kick_speed_factor_stddev`, 0.10); zero stds give exact kicks. The
+kicker face restitution is low (`ball_kicker_normal` 0.8): half the balls that
+reach a dribbling robot's face are captured in real games.
 
 **Dribbler** (`dribbler_speed > 0`, RPM): if the ball is in the *mouth zone*
 (kick zone extended 0.01 m inward), the dribbler applies to the ball a force
@@ -477,9 +494,27 @@ README, memory notes.
 ## 10. Implementation status and known gaps (2026-09-07)
 
 Implemented and tested: everything in §3–§8 except the items below. Full
-workspace: 144 tests, clippy clean. Throughput on the reference machine:
-about 17 µs per substep with 22 commanded robots in release (60× real time
-including 73.3 Hz vision on two cameras), 20 µs measured by the running CLI.
+workspace: 178 tests, clippy clean. Throughput on the reference machine:
+about 17 µs per substep with 22 commanded robots in release (57× real time
+including 73.3 Hz vision on two cameras).
+
+**Calibration update (2026-09-07).** Ten German Open 2026 and RoboCup 2026
+game logs were analysed with `ssl-logtool` (`docs/calibration/vision.md`,
+`dynamics.md`). Every fitted value is a configurable default in `params.rs`
+with named presets; the model changes the data demanded are implemented:
+speed-dependent rolling deceleration, separate z damping for later chip
+hops, tangential hull damping and a low-restitution capturing kicker face,
+per-robot dribbler hold budget, kick direction/elevation/speed errors, the
+cut-cylinder hull (chord in robot–robot contacts, landing on and rolling off
+the top, rim), a two-camera 73 Hz rig at 6.4 m with per-camera phase, a hard
+field-of-view radius, a static per-camera calibration warp plus constant
+offset (the dominant real error: 20 mm between cameras versus 0.4 mm white
+noise), centreline spurious dribbler balls, an area model without the
+horizontal range term, measured confidences, duplicate ids, optional `area`,
+and scripted vision outages. Not implemented from the reports: quadratic
+roll law, per-sample dribbler loss hazard, per-camera intrinsics (mixed
+sensor sizes), frame-period jitter, and tuning `ball_visibility_threshold`
+to the measured 0.65 detection rate at 0.10 m.
 
 Deviations and simplifications, all deliberate:
 - `realism.command_delay` is accepted in config but not applied; commands

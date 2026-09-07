@@ -13,12 +13,25 @@
 //! `disc(R) ∩ {x <= c2d}` with the ball disc: a circle of radius `R + r`
 //! wherever the ball centre lies outside the mouth cone (`|phi| >= theta`,
 //! `theta = acos(c2d / R)`), and a capsule of radius `r` around the chord
-//! (flat kicker face plus rounded corners) inside the cone. Robots ignore the
-//! chord between themselves (disc only).
+//! (flat kicker face plus rounded corners) inside the cone.
 //!
-//! Robot contacts: disc vs disc and disc vs wall, resolved by mass-weighted
-//! positional correction plus restitution/friction impulses over a few
-//! iterations.
+//! The robot is a cut cylinder of height `h`. Three height regimes for the
+//! ball centre `z`:
+//! - `z - r >= h`: the ball is above the top. If it descends onto the
+//!   footprint it lands on the flat top (vertical normal, `RobotTop`); while
+//!   its centre is inside the footprint the top is its floor
+//!   (`support_height`, used by `physics::step_ball` to raise the trajectory).
+//! - `h <= z < h + r`: the rim band. A ball outside the footprint meets the
+//!   top edge: it is swept as a disc of radius `sqrt(r^2 - (z - h)^2)` and the
+//!   contact normal is tilted from horizontal toward vertical (sphere vs
+//!   edge, `RobotRim`). A ball with its centre inside the footprint is on top.
+//! - `z < h`: sideways contact with the hull as before (height gate).
+//!
+//! Robot contacts: cut disc vs cut disc (when
+//! `ContactParams::robot_hull_chord_contacts`, separating-axis test over the
+//! centre line, both face normals and the corner-to-centre axes; discs
+//! otherwise) and disc vs wall, resolved by mass-weighted positional
+//! correction plus restitution/friction impulses over a few iterations.
 
 use std::collections::BTreeMap;
 
@@ -26,6 +39,7 @@ use crate::field::{FieldGeometry, WallSegment};
 use crate::params::{BallParams, ContactParams};
 use crate::robot::Robot;
 use crate::types::{rotate, BallState, Event, RobotId, Vec2, Vec3};
+use crate::GRAVITY;
 
 /// Iterations of the robot contact solver.
 const ROBOT_ITERATIONS: usize = 4;
@@ -37,6 +51,8 @@ const ROBOT_PUSH_CAP: f64 = 0.002;
 const COLLISION_EVENT_SPEED: f64 = 0.02;
 /// Tolerance used for "already touching" tests.
 const TOUCH_EPS: f64 = 1e-9;
+/// Height tolerance [m] for "the ball rests on a robot top" tests.
+const TOP_EPS: f64 = 1e-9;
 
 /// What the ball hit.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -45,6 +61,10 @@ pub enum Surface {
     RobotHull(RobotId),
     /// Flat kicker face of a robot.
     KickerFace(RobotId),
+    /// Flat top of a robot (the ball lands on it).
+    RobotTop(RobotId),
+    /// Top edge of a robot (sphere vs edge, tilted normal).
+    RobotRim(RobotId),
     /// Boundary board or goal frame.
     Wall {
         /// True for goal posts / back wall.
@@ -54,17 +74,39 @@ pub enum Surface {
     Room,
 }
 
+impl Surface {
+    /// The robot involved, if any.
+    pub fn robot(&self) -> Option<RobotId> {
+        match *self {
+            Surface::RobotHull(id)
+            | Surface::KickerFace(id)
+            | Surface::RobotTop(id)
+            | Surface::RobotRim(id) => Some(id),
+            Surface::Wall { .. } | Surface::Room => None,
+        }
+    }
+}
+
 /// An imminent ball contact.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BallContact {
     /// Time from the start of the sweep [s], `0 <= t <= dt`.
     pub time: f64,
-    /// Contact normal pointing from the surface toward the ball (unit, horizontal).
-    pub normal: Vec2,
+    /// Contact normal pointing from the surface toward the ball (unit).
+    /// Horizontal for hull, face, wall and room contacts; vertical for a
+    /// robot top; tilted for a robot rim.
+    pub normal: Vec3,
     /// Velocity of the surface at the contact point [m/s] (includes robot rotation).
     pub surface_velocity: Vec2,
     /// What was hit.
     pub surface: Surface,
+}
+
+impl BallContact {
+    /// Horizontal part of the normal (zero for a top contact).
+    pub fn normal_xy(&self) -> Vec2 {
+        Vec2::new(self.normal.x, self.normal.y)
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -90,6 +132,12 @@ fn ray_circle_entry(p: Vec2, d: Vec2, c: Vec2, radius: f64) -> Option<f64> {
     }
     let t = (-b - disc.sqrt()) / (2.0 * a);
     (t >= 0.0).then_some(t)
+}
+
+/// Time [s] for a ball `dz >= 0` above a level with vertical velocity `vz` to
+/// descend to it under gravity (0 if already there and descending).
+fn fall_time(dz: f64, vz: f64) -> f64 {
+    (vz + (vz * vz + 2.0 * GRAVITY * dz).sqrt()) / GRAVITY
 }
 
 /// Which feature of the hull the closest point lies on.
@@ -146,6 +194,11 @@ impl Hull {
                 (d - self.radius, p / d, HullFeature::Round)
             }
         }
+    }
+
+    /// True if the point (robot frame) lies inside the footprint.
+    fn contains(&self, p: Vec2) -> bool {
+        self.signed_distance(p).0 <= 0.0
     }
 
     /// Sweep a ball of radius `r` (centre `p`, relative velocity `d`) for `dt`
@@ -264,14 +317,19 @@ fn sweep_room(p: Vec2, d: Vec2, r: f64, dt: f64, half: Vec2) -> Option<(f64, Vec
     best
 }
 
+fn horizontal(v: Vec2) -> Vec3 {
+    Vec3::new(v.x, v.y, 0.0)
+}
+
 // ----------------------------------------------------------------------------
 // Ball sweep
 // ----------------------------------------------------------------------------
 
 /// Earliest contact of the ball moving from `ball` for `dt` seconds, if any.
 /// Contacts with the room box are always considered; contacts with walls
-/// only when `ball.pos.z - radius < wall.height`; contacts with robots only
-/// when `ball.pos.z - radius < robot.specs.height`.
+/// only when `ball.pos.z - radius < wall.height`; sideways contacts with
+/// robots only when `ball.pos.z - radius < robot.specs.height` (the rim band
+/// above the top plane uses the tilted edge normal), plus landings on robot tops.
 pub fn sweep_ball(
     ball: &BallState,
     dt: f64,
@@ -296,7 +354,16 @@ pub fn sweep_ball_except(
     let r = params.radius;
     let p = ball.pos_xy();
     let v = ball.vel_xy();
-    let bottom = ball.pos.z - r;
+    let z = ball.pos.z;
+    let vz = ball.vel.z;
+    let bottom = z - r;
+    // Deepest centre height reached during the step (ballistic while airborne).
+    let z_end = if z > r + TOP_EPS || vz != 0.0 {
+        z + vz * dt - 0.5 * GRAVITY * dt * dt
+    } else {
+        z
+    };
+    let z_deep = z.min(z_end);
     let mut best: Option<BallContact> = None;
     let mut consider = |c: BallContact| {
         if best.is_none_or(|b| c.time < b.time) {
@@ -305,12 +372,53 @@ pub fn sweep_ball_except(
     };
 
     for robot in robots.values() {
-        if Some(robot.id) == skip || bottom >= robot.specs.height {
+        if Some(robot.id) == skip {
             continue;
         }
+        let h = robot.specs.height;
         let hull = Hull::of(robot);
         let pl = rotate(p - robot.pos, -robot.orientation);
         let dl = rotate(v - robot.vel, -robot.orientation);
+        if bottom >= h - TOP_EPS {
+            // Above the top: landing on the flat top when descending onto the footprint.
+            let dz = (bottom - h).max(0.0);
+            if dz == 0.0 && vz >= 0.0 {
+                continue; // resting on or leaving the top
+            }
+            let t = fall_time(dz, vz);
+            if t > dt || !hull.contains(pl + dl * t) {
+                continue;
+            }
+            let hit = p + v * t;
+            let lever = hit - (robot.pos + robot.vel * t);
+            consider(BallContact {
+                time: t,
+                normal: Vec3::Z,
+                surface_velocity: robot.vel + Vec2::new(-lever.y, lever.x) * robot.omega,
+                surface: Surface::RobotTop(robot.id),
+            });
+            continue;
+        }
+        if z >= h {
+            // Rim band: centre above the top plane, underside below it.
+            if hull.contains(pl) {
+                continue; // on the top: the top is its floor
+            }
+            let zc = (z_deep.max(h) - h).min(r);
+            let r_eff = (r * r - zc * zc).sqrt();
+            if let Some((t, n_local, _)) = hull.sweep(pl, dl, r_eff, dt) {
+                let n_h = rotate(n_local, robot.orientation);
+                let hit = p + v * t;
+                let lever = hit - n_h * r_eff - (robot.pos + robot.vel * t);
+                consider(BallContact {
+                    time: t,
+                    normal: Vec3::new(n_h.x * r_eff / r, n_h.y * r_eff / r, zc / r),
+                    surface_velocity: robot.vel + Vec2::new(-lever.y, lever.x) * robot.omega,
+                    surface: Surface::RobotRim(robot.id),
+                });
+            }
+            continue;
+        }
         if let Some((t, n_local, feat)) = hull.sweep(pl, dl, r, dt) {
             let normal = rotate(n_local, robot.orientation);
             let hit = p + v * t;
@@ -319,7 +427,7 @@ pub fn sweep_ball_except(
             let surface_velocity = robot.vel + Vec2::new(-lever.y, lever.x) * robot.omega;
             consider(BallContact {
                 time: t,
-                normal,
+                normal: horizontal(normal),
                 surface_velocity,
                 surface: match feat {
                     HullFeature::Face => Surface::KickerFace(robot.id),
@@ -336,7 +444,7 @@ pub fn sweep_ball_except(
         if let Some((t, normal)) = sweep_wall(p, v, r, dt, wall) {
             consider(BallContact {
                 time: t,
-                normal,
+                normal: horizontal(normal),
                 surface_velocity: Vec2::ZERO,
                 surface: Surface::Wall {
                     is_goal: wall.is_goal,
@@ -348,13 +456,32 @@ pub fn sweep_ball_except(
     if let Some((t, normal)) = sweep_room(p, v, r, dt, room_half_extents) {
         consider(BallContact {
             time: t,
-            normal,
+            normal: horizontal(normal),
             surface_velocity: Vec2::ZERO,
             surface: Surface::Room,
         });
     }
 
     best
+}
+
+/// Height [m] of the surface supporting the ball: the top of the tallest
+/// robot whose footprint contains the ball centre while the centre is at or
+/// above that top, else 0 (the carpet).
+pub fn support_height(ball: &BallState, robots: &BTreeMap<RobotId, Robot>) -> f64 {
+    let mut floor = 0.0;
+    let p = ball.pos_xy();
+    for robot in robots.values() {
+        let h = robot.specs.height;
+        if h <= floor || ball.pos.z < h {
+            continue;
+        }
+        let pl = rotate(p - robot.pos, -robot.orientation);
+        if Hull::of(robot).contains(pl) {
+            floor = h;
+        }
+    }
+    floor
 }
 
 /// Apply the contact response to `ball` and return the impulse [N s] the
@@ -366,34 +493,42 @@ pub fn resolve_ball_contact(
     contacts: &ContactParams,
 ) -> Vec3 {
     let n = contact.normal;
-    let t = Vec2::new(-n.y, n.x);
-    let u = contact.surface_velocity;
-    let v = ball.vel_xy();
+    let u = horizontal(contact.surface_velocity);
+    let v = ball.vel;
     let un = n.dot(u);
     let vn = n.dot(v);
     if un <= vn {
         return Vec3::ZERO; // receding
     }
     let (damp_n, damp_t) = match contact.surface {
-        Surface::RobotHull(_) => (contacts.ball_robot_normal, contacts.ball_robot_tangent),
+        Surface::RobotHull(_) | Surface::RobotRim(_) => {
+            (contacts.ball_robot_normal, contacts.ball_robot_tangent)
+        }
         Surface::KickerFace(_) => (contacts.ball_kicker_normal, contacts.ball_kicker_tangent),
+        Surface::RobotTop(_) => (
+            contacts.ball_robot_top_normal,
+            contacts.ball_robot_top_tangent,
+        ),
         Surface::Wall { .. } | Surface::Room => {
             (contacts.ball_wall_normal, contacts.ball_wall_tangent)
         }
     };
     let vn_new = un + (un - vn) * (1.0 - damp_n);
-    let vt_new = damp_t * t.dot(u) + (1.0 - damp_t) * t.dot(v);
-    let vz_new = (1.0 - damp_t) * ball.vel.z;
-    let new_vel = Vec3::new(
-        n.x * vn_new + t.x * vt_new,
-        n.y * vn_new + t.y * vt_new,
-        vz_new,
-    );
+    let v_tan = v - n * vn;
+    let u_tan = u - n * un;
+    let new_vel = n * vn_new + u_tan * damp_t + v_tan * (1.0 - damp_t);
     let impulse = (ball.vel - new_vel) * params.mass;
     ball.vel = new_vel;
-    // Spin: mirror about the contact plane and damp.
     let s = ball.spin;
-    ball.spin = (s - n * (2.0 * s.dot(n))) * contacts.spin_retention;
+    let n_xy = contact.normal_xy();
+    ball.spin = if n_xy.length_squared() < 1e-24 {
+        // Landed on a flat top: rolling on it, like a touchdown on the carpet.
+        Vec2::new(new_vel.x, new_vel.y)
+    } else {
+        // Spin: mirror about the (horizontal) contact plane and damp.
+        let m = n_xy.normalize();
+        (s - m * (2.0 * s.dot(m))) * contacts.spin_retention
+    };
     impulse
 }
 
@@ -411,7 +546,8 @@ pub fn depenetrate_ball(
 
 /// [`depenetrate_ball`] ignoring one robot (the one whose dribbler holds the ball).
 /// Robot penetrations are relaxed by at most 2 mm per call so a ball released
-/// inside the mouth eases out instead of jumping.
+/// inside the mouth eases out instead of jumping. A ball whose centre is over
+/// a robot top is not pushed (the top becomes its floor instead).
 pub fn depenetrate_ball_except(
     ball: &mut BallState,
     robots: &BTreeMap<RobotId, Robot>,
@@ -422,17 +558,29 @@ pub fn depenetrate_ball_except(
 ) -> bool {
     let r = params.radius;
     let mut moved = false;
-    let bottom = ball.pos.z - r;
+    let z = ball.pos.z;
+    let bottom = z - r;
 
     for robot in robots.values() {
-        if Some(robot.id) == skip || bottom >= robot.specs.height {
+        let h = robot.specs.height;
+        if Some(robot.id) == skip || bottom >= h - TOP_EPS {
             continue;
         }
         let hull = Hull::of(robot);
         let pl = rotate(ball.pos_xy() - robot.pos, -robot.orientation);
         let (sd, n_local, _) = hull.signed_distance(pl);
-        if sd < r - TOUCH_EPS {
-            let push = (r - sd).min(ROBOT_PUSH_CAP);
+        // Rim band: the edge only reaches out to the reduced radius.
+        let r_here = if z >= h {
+            if sd <= 0.0 {
+                continue;
+            }
+            let zc = z - h;
+            (r * r - zc * zc).max(0.0).sqrt()
+        } else {
+            r
+        };
+        if sd < r_here - TOUCH_EPS {
+            let push = (r_here - sd).min(ROBOT_PUSH_CAP);
             let n = rotate(n_local, robot.orientation);
             ball.pos.x += n.x * push;
             ball.pos.y += n.y * push;
@@ -502,6 +650,14 @@ struct Body {
     vel: Vec2,
     radius: f64,
     mass: f64,
+    /// Kicker heading (unit).
+    heading: Vec2,
+    /// Distance from the centre to the flat front chord.
+    c2d: f64,
+    /// Half width of the chord.
+    half_width: f64,
+    /// Cosine of the mouth half angle (`c2d / radius`).
+    cos_theta: f64,
 }
 
 impl Body {
@@ -511,7 +667,93 @@ impl Body {
         vel: Vec2::ZERO,
         radius: 0.0,
         mass: 1.0,
+        heading: Vec2::X,
+        c2d: 0.0,
+        half_width: 0.0,
+        cos_theta: 1.0,
     };
+
+    fn of(r: &Robot) -> Body {
+        Body {
+            id: r.id,
+            pos: r.pos,
+            vel: r.vel,
+            radius: r.specs.radius,
+            mass: r.specs.mass.max(1e-6),
+            heading: r.heading(),
+            c2d: r.specs.center_to_dribbler,
+            half_width: r.specs.front_half_width(),
+            cos_theta: (r.specs.center_to_dribbler / r.specs.radius).clamp(-1.0, 1.0),
+        }
+    }
+
+    /// Support function of the cut disc: `max d . (x - pos)` over the hull
+    /// for a unit direction `d`. Inside the mouth cone the extreme point is a
+    /// chord corner, elsewhere the arc.
+    fn support(&self, d: Vec2) -> f64 {
+        let dn = d.dot(self.heading);
+        if dn > self.cos_theta {
+            let dt = (d.y * self.heading.x - d.x * self.heading.y).abs();
+            self.c2d * dn + self.half_width * dt
+        } else {
+            self.radius
+        }
+    }
+
+    /// World positions of the two chord corners.
+    fn corners(&self) -> [Vec2; 2] {
+        let t = Vec2::new(-self.heading.y, self.heading.x);
+        let f = self.pos + self.heading * self.c2d;
+        [f + t * self.half_width, f - t * self.half_width]
+    }
+}
+
+/// Overlap of `b` into `a` along the unit axis `d` (pointing from `a` toward
+/// `b`); `<= 0` proves the hulls are separated.
+fn penetration_along(a: &Body, b: &Body, d: Vec2) -> f64 {
+    a.support(d) + b.support(-d) - (b.pos - a.pos).dot(d)
+}
+
+/// Minimum translation (unit normal from `a` to `b`, depth) separating two
+/// cut discs, or `None` if they do not overlap. Separating-axis test over the
+/// centre line, both face normals (both signs) and the corner-to-centre axes,
+/// which are the normals of every feature pair except corner-corner.
+fn cut_disc_overlap(a: &Body, b: &Body) -> Option<(Vec2, f64)> {
+    let delta = b.pos - a.pos;
+    let dist = delta.length();
+    let mut axes = [Vec2::X; 9];
+    let mut n = 0;
+    axes[n] = if dist > 1e-9 { delta / dist } else { Vec2::X };
+    n += 1;
+    for h in [a.heading, -a.heading, b.heading, -b.heading] {
+        axes[n] = h;
+        n += 1;
+    }
+    for c in a.corners() {
+        let v = b.pos - c;
+        if v.length_squared() > 1e-18 {
+            axes[n] = v.normalize();
+            n += 1;
+        }
+    }
+    for c in b.corners() {
+        let v = c - a.pos;
+        if v.length_squared() > 1e-18 {
+            axes[n] = v.normalize();
+            n += 1;
+        }
+    }
+    let mut best: Option<(Vec2, f64)> = None;
+    for &d in &axes[..n] {
+        let pen = penetration_along(a, b, d);
+        if pen <= 0.0 {
+            return None;
+        }
+        if best.is_none_or(|(_, p)| pen < p) {
+            best = Some((d, pen));
+        }
+    }
+    best
 }
 
 /// Resolve robot-robot and robot-wall overlaps and velocities in place.
@@ -530,19 +772,14 @@ pub fn resolve_robot_contacts(
         if n == MAX_ROBOTS {
             break;
         }
-        bodies[n] = Body {
-            id: r.id,
-            pos: r.pos,
-            vel: r.vel,
-            radius: r.specs.radius,
-            mass: r.specs.mass.max(1e-6),
-        };
+        bodies[n] = Body::of(r);
         n += 1;
     }
     let mut emitted = [0u32; MAX_ROBOTS];
     let e_rr = contacts.robot_robot_restitution.clamp(0.0, 1.0);
     let k_rr = contacts.robot_robot_friction.clamp(0.0, 1.0);
     let e_rw = contacts.robot_wall_restitution.clamp(0.0, 1.0);
+    let chord = contacts.robot_hull_chord_contacts;
     let room = field.room_half_extents();
 
     for _ in 0..ROBOT_ITERATIONS {
@@ -554,10 +791,17 @@ pub fn resolve_robot_contacts(
                 let dist = delta.length();
                 let min_d = bi.radius + bj.radius;
                 if dist >= min_d {
-                    continue;
+                    continue; // the cut hulls lie inside the discs
                 }
-                let nrm = if dist > 1e-9 { delta / dist } else { Vec2::X };
-                let pen = min_d - dist;
+                let (nrm, pen) = if chord {
+                    match cut_disc_overlap(&bi, &bj) {
+                        Some(x) => x,
+                        None => continue,
+                    }
+                } else {
+                    let nrm = if dist > 1e-9 { delta / dist } else { Vec2::X };
+                    (nrm, min_d - dist)
+                };
                 let inv_mi = 1.0 / bi.mass;
                 let inv_mj = 1.0 / bj.mass;
                 let inv_sum = inv_mi + inv_mj;
@@ -639,6 +883,7 @@ mod tests {
     use super::*;
     use crate::params::RobotSpecs;
     use crate::types::Team;
+    use std::f64::consts::PI;
 
     fn params() -> BallParams {
         BallParams::default()
@@ -685,7 +930,7 @@ mod tests {
         ball.spin = Vec2::new(0.5, 0.0);
         let contact = BallContact {
             time: 0.0,
-            normal: Vec2::X,
+            normal: Vec3::X,
             surface_velocity: Vec2::ZERO,
             surface: Surface::RobotHull(RobotId::new(Team::Blue, 0)),
         };
@@ -696,7 +941,7 @@ mod tests {
         // surface moving away faster than the ball approaches: also no effect
         let contact = BallContact {
             surface_velocity: Vec2::new(2.0, 0.0),
-            normal: Vec2::NEG_X,
+            normal: Vec3::NEG_X,
             ..contact
         };
         let mut ball = ball_at(Vec2::ZERO, Vec2::new(1.0, 0.0));
@@ -714,7 +959,7 @@ mod tests {
         ball.spin = Vec2::new(-2.0, 0.5);
         let contact = BallContact {
             time: 0.0,
-            normal: Vec2::X,
+            normal: Vec3::X,
             surface_velocity: Vec2::ZERO,
             surface: Surface::Wall { is_goal: false },
         };
@@ -735,13 +980,52 @@ mod tests {
         resolve_ball_contact(&mut ball, &contact, &p, &c);
         assert!((ball.vel.y - c.ball_kicker_tangent).abs() < 1e-12);
         assert!((ball.vel.x - (1.0 - c.ball_kicker_normal)).abs() < 1e-12);
+        // vertical wall: the vertical velocity is scaled by the tangential blend
+        let mut ball = ball_at(Vec2::ZERO, Vec2::new(-1.0, 0.0));
+        ball.vel.z = -3.0;
+        let contact = BallContact {
+            surface_velocity: Vec2::ZERO,
+            surface: Surface::KickerFace(RobotId::new(Team::Blue, 1)),
+            ..contact
+        };
+        resolve_ball_contact(&mut ball, &contact, &p, &c);
+        assert!((ball.vel.z - (-3.0) * (1.0 - c.ball_kicker_tangent)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn top_kernel_uses_top_damping_and_blends_horizontal_velocity() {
+        let p = params();
+        let c = ContactParams::default();
+        let mut ball = ball_at(Vec2::ZERO, Vec2::new(0.8, -0.2));
+        ball.pos.z = 0.15 + p.radius;
+        ball.vel.z = -2.0;
+        ball.spin = Vec2::new(5.0, 5.0);
+        let contact = BallContact {
+            time: 0.0,
+            normal: Vec3::Z,
+            surface_velocity: Vec2::new(1.0, 0.5),
+            surface: Surface::RobotTop(RobotId::new(Team::Blue, 0)),
+        };
+        let j = resolve_ball_contact(&mut ball, &contact, &p, &c);
+        assert!((ball.vel.z - 2.0 * (1.0 - c.ball_robot_top_normal)).abs() < 1e-12);
+        let kt = c.ball_robot_top_tangent;
+        assert!((ball.vel.x - (kt * 1.0 + (1.0 - kt) * 0.8)).abs() < 1e-12);
+        assert!((ball.vel.y - (kt * 0.5 + (1.0 - kt) * -0.2)).abs() < 1e-12);
+        // rolling on the top afterwards
+        assert_eq!(ball.spin, ball.vel_xy());
+        assert!(j.z < 0.0);
+        // a rising ball is receding: nothing happens
+        let mut up = ball;
+        let before = up;
+        assert_eq!(resolve_ball_contact(&mut up, &contact, &p, &c), Vec3::ZERO);
+        assert_eq!(up, before);
     }
 
     #[test]
     fn rolling_ball_bounces_off_stationary_robot() {
         let p = params();
         let c = ContactParams::default();
-        let r = robot(0, Vec2::ZERO, std::f64::consts::PI); // facing -x, ball hits the round back
+        let r = robot(0, Vec2::ZERO, PI); // facing -x, ball hits the round back
         let map = robots(vec![r]);
         let mut ball = ball_at(Vec2::new(0.5, 0.0), Vec2::new(-2.0, 0.0));
         ball.spin = ball.vel_xy();
@@ -761,7 +1045,7 @@ mod tests {
         }
         let (ct, j) = hit.expect("ball should hit the robot");
         assert!(matches!(ct.surface, Surface::RobotHull(_)));
-        assert!((ct.normal - Vec2::X).length() < 1e-9);
+        assert!((ct.normal - Vec3::X).length() < 1e-9);
         let expected_x = 0.09 + p.radius;
         assert!((ball.pos.x - expected_x).abs() < 1e-6, "x={}", ball.pos.x);
         assert!((ball.vel.x - 2.0 * (1.0 - c.ball_robot_normal)).abs() < 1e-9);
@@ -796,14 +1080,84 @@ mod tests {
         let ball = ball_at(Vec2::new(-0.3, 0.0), Vec2::new(4.0, 0.0));
         let ct = sweep_ball(&ball, 0.1, &map, &[], ROOM, &p).unwrap();
         assert!(matches!(ct.surface, Surface::RobotHull(_)));
-        assert!((ct.normal - Vec2::NEG_X).length() < 1e-9);
-        // height gate: ball flying above the robot passes
+        assert!((ct.normal - Vec3::NEG_X).length() < 1e-9);
+        // height gate: ball flying above the robot passes (horizontally)
         let mut high = ball_at(Vec2::new(0.3, 0.0), Vec2::new(-4.0, 0.0));
         high.pos.z = 0.3;
         assert!(sweep_ball(&high, 0.1, &map, &[], ROOM, &p).is_none());
         // moving away: nothing
         let ball = ball_at(Vec2::new(0.3, 0.0), Vec2::new(4.0, 0.0));
         assert!(sweep_ball(&ball, 0.1, &map, &[], ROOM, &p).is_none());
+    }
+
+    #[test]
+    fn top_landing_and_rim_geometry() {
+        let p = params();
+        let r = robot(0, Vec2::ZERO, 0.0);
+        let h = r.specs.height;
+        let map = robots(vec![r]);
+        // falling straight onto the centre of the top
+        let mut ball = ball_at(Vec2::new(0.02, -0.03), Vec2::new(0.1, 0.0));
+        ball.pos.z = h + p.radius + 0.01;
+        ball.vel.z = -1.0;
+        let ct = sweep_ball(&ball, 0.1, &map, &[], ROOM, &p).unwrap();
+        assert!(matches!(ct.surface, Surface::RobotTop(_)));
+        assert_eq!(ct.normal, Vec3::Z);
+        let t_expected = (-1.0 + (1.0f64 + 2.0 * GRAVITY * 0.01).sqrt()) / GRAVITY;
+        assert!((ct.time - t_expected).abs() < 1e-12);
+        // resting on the top: no contact; rising: no contact
+        let mut rest = ball;
+        rest.pos.z = h + p.radius;
+        rest.vel.z = 0.0;
+        assert!(sweep_ball(&rest, 0.001, &map, &[], ROOM, &p).is_none());
+        rest.vel.z = 3.0;
+        assert!(sweep_ball(&rest, 0.001, &map, &[], ROOM, &p).is_none());
+        // descending onto the top but landing beyond the footprint: no top contact
+        let mut miss = ball;
+        miss.pos.x = 0.2;
+        assert!(sweep_ball(&miss, 0.1, &map, &[], ROOM, &p).is_none());
+        // support height: over the footprint and above the top plane
+        assert_eq!(support_height(&rest, &map), h);
+        assert_eq!(support_height(&miss, &map), 0.0);
+        let mut low = rest;
+        low.pos.z = h - 0.001;
+        assert_eq!(support_height(&low, &map), 0.0);
+
+        // rim: ball in the band moving horizontally toward the robot's back,
+        // one substep away (the effective radius is taken at the deepest
+        // point of the step, a few micrometres lower over 1 ms of free fall)
+        let zc = 0.5 * p.radius;
+        let r_eff = (p.radius * p.radius - zc * zc).sqrt();
+        let x0 = -0.09 - r_eff - 0.001;
+        let mut rim = ball_at(Vec2::new(x0, 0.0), Vec2::new(2.0, 0.0));
+        rim.pos.z = h + zc;
+        let ct = sweep_ball(&rim, 0.001, &map, &[], ROOM, &p).unwrap();
+        assert!(matches!(ct.surface, Surface::RobotRim(_)));
+        // the horizontal sweep radius is the reduced one
+        let x_hit = x0 + 2.0 * ct.time;
+        assert!((x_hit - (-0.09 - r_eff)).abs() < 1e-5, "x_hit {x_hit}");
+        // tilted normal: unit, pointing away from the robot and upward
+        assert!((ct.normal.length() - 1.0).abs() < 1e-12);
+        assert!(ct.normal.x < 0.0 && ct.normal.z > 0.0);
+        assert!((ct.normal.z - zc / p.radius).abs() < 1e-3);
+        // a ball skimming at the top plane level: normal is horizontal (sideways contact)
+        let mut level = ball_at(
+            Vec2::new(-0.09 - p.radius - 0.001, 0.0),
+            Vec2::new(2.0, 0.0),
+        );
+        level.pos.z = h;
+        let ct = sweep_ball(&level, 0.001, &map, &[], ROOM, &p).unwrap();
+        assert!((ct.normal.z).abs() < 1e-12);
+        assert!(matches!(ct.surface, Surface::RobotRim(_)));
+        // the rim bounce never adds energy
+        let c = ContactParams::default();
+        let mut b = rim;
+        b.vel.z = -0.5;
+        let ct = sweep_ball(&b, 0.001, &map, &[], ROOM, &p).unwrap();
+        let e0 = b.vel.length_squared();
+        resolve_ball_contact(&mut b, &ct, &p, &c);
+        assert!(b.vel.length_squared() <= e0 + 1e-12);
+        assert!(b.vel.dot(ct.normal) >= 0.0);
     }
 
     #[test]
@@ -832,7 +1186,7 @@ mod tests {
         let ct = sweep_ball(&ball, 1.0, &map, &[w], ROOM, &p).unwrap();
         assert!(matches!(ct.surface, Surface::Wall { is_goal: false }));
         assert!((ct.time - (0.5 - p.radius) / 2.0).abs() < 1e-9);
-        assert_eq!(ct.normal, Vec2::NEG_X);
+        assert_eq!(ct.normal, Vec3::NEG_X);
         // beyond the segment: miss
         let ball = ball_at(Vec2::new(0.5, 1.5), Vec2::new(2.0, 0.0));
         assert!(sweep_ball(&ball, 1.0, &map, &[w], ROOM, &p).is_none());
@@ -851,7 +1205,7 @@ mod tests {
         let ball = ball_at(Vec2::new(9.5, 0.0), Vec2::new(2.0, 0.0));
         let ct = sweep_ball(&ball, 1.0, &map, &[], ROOM, &p).unwrap();
         assert_eq!(ct.surface, Surface::Room);
-        assert_eq!(ct.normal, Vec2::NEG_X);
+        assert_eq!(ct.normal, Vec3::NEG_X);
     }
 
     #[test]
@@ -889,6 +1243,20 @@ mod tests {
             &p,
             Some(RobotId::new(Team::Blue, 0))
         ));
+        // rim band: only the reduced radius counts, and a ball over the top is left alone
+        let h = map.values().next().unwrap().specs.height;
+        let zc = 0.8 * p.radius;
+        let r_eff = (p.radius * p.radius - zc * zc).sqrt();
+        let mut band = ball_at(Vec2::new(-0.09 - r_eff + 0.001, 0.0), Vec2::ZERO);
+        band.pos.z = h + zc;
+        assert!(depenetrate_ball(&mut band, &map, &[], ROOM, &p));
+        assert!((band.pos.x - (-0.09 - r_eff)).abs() < 1e-12);
+        let mut over = ball_at(Vec2::new(0.02, 0.0), Vec2::ZERO);
+        over.pos.z = h + zc;
+        assert!(!depenetrate_ball(&mut over, &map, &[], ROOM, &p));
+        let mut above = ball_at(Vec2::new(0.02, 0.0), Vec2::ZERO);
+        above.pos.z = h + p.radius + 0.1;
+        assert!(!depenetrate_ball(&mut above, &map, &[], ROOM, &p));
         // wall
         let w = wall(Vec2::new(1.0, -1.0), Vec2::new(1.0, 1.0), Vec2::NEG_X, 0.1);
         let mut ball = ball_at(Vec2::new(0.99, 0.0), Vec2::ZERO);
@@ -922,7 +1290,8 @@ mod tests {
     fn robot_overlap_separates_without_energy_gain() {
         let c = ContactParams::default();
         let field = FieldGeometry::default();
-        let mut a = robot(0, Vec2::new(0.0, 0.0), 0.0);
+        // backs toward each other: round vs round, separation R + R
+        let mut a = robot(0, Vec2::new(0.0, 0.0), PI);
         let mut b = robot(1, Vec2::new(0.15, 0.0), 0.0);
         a.vel = Vec2::new(1.0, 0.0);
         b.vel = Vec2::new(-1.0, 0.0);
@@ -954,6 +1323,79 @@ mod tests {
     }
 
     #[test]
+    fn chord_contacts_face_to_face_and_face_to_disc() {
+        let c = ContactParams::default();
+        assert!(c.robot_hull_chord_contacts);
+        let field = FieldGeometry::default();
+        let c2d = RobotSpecs::default().center_to_dribbler;
+        let r = RobotSpecs::default().radius;
+        // face to face: separation 2 c2d
+        let a = robot(0, Vec2::ZERO, 0.0);
+        let b = robot(1, Vec2::new(0.14, 0.0), PI);
+        let mut map = robots(vec![a, b]);
+        let mut events = Vec::new();
+        resolve_robot_contacts(&mut map, &field, &[], &c, &mut events);
+        let pa = map[&RobotId::new(Team::Blue, 0)].pos;
+        let pb = map[&RobotId::new(Team::Blue, 1)].pos;
+        assert!(
+            ((pb - pa).length() - 2.0 * c2d).abs() < 1e-9,
+            "{}",
+            (pb - pa).length()
+        );
+        assert!((pa.x + 0.005).abs() < 1e-9 && (pb.x - 0.145).abs() < 1e-9);
+        // not touching at 2 c2d + 1 mm even though the discs overlap
+        let a = robot(0, Vec2::ZERO, 0.0);
+        let b = robot(1, Vec2::new(2.0 * c2d + 0.001, 0.0), PI);
+        let mut map = robots(vec![a, b]);
+        resolve_robot_contacts(&mut map, &field, &[], &c, &mut events);
+        assert!((map[&RobotId::new(Team::Blue, 1)].pos.x - (2.0 * c2d + 0.001)).abs() < 1e-12);
+        // face to disc (b faces away): separation c2d + R
+        let a = robot(0, Vec2::ZERO, 0.0);
+        let b = robot(1, Vec2::new(0.15, 0.0), 0.0);
+        let mut map = robots(vec![a, b]);
+        resolve_robot_contacts(&mut map, &field, &[], &c, &mut events);
+        let pa = map[&RobotId::new(Team::Blue, 0)].pos;
+        let pb = map[&RobotId::new(Team::Blue, 1)].pos;
+        assert!(
+            ((pb - pa).length() - (c2d + r)).abs() < 1e-9,
+            "{}",
+            (pb - pa).length()
+        );
+        // corner vs disc: a's corner pokes b's side; separated when the corner
+        // is clear. The approach direction lies in the corner's normal cone
+        // (between the face normal at 0 deg and the arc normal at 33.6 deg).
+        let hw = RobotSpecs::default().front_half_width();
+        let corner = Vec2::new(c2d, hw);
+        let dir = Vec2::from_angle(15f64.to_radians());
+        let a = robot(0, Vec2::ZERO, 0.0);
+        let b = robot(1, corner + dir * (r + 0.001), PI / 2.0);
+        let mut map = robots(vec![a, b]);
+        let before = map[&RobotId::new(Team::Blue, 1)].pos;
+        resolve_robot_contacts(&mut map, &field, &[], &c, &mut events);
+        assert!((map[&RobotId::new(Team::Blue, 1)].pos - before).length() < 1e-12);
+        let a = robot(0, Vec2::ZERO, 0.0);
+        let b = robot(1, corner + dir * (r - 0.002), PI / 2.0);
+        let mut map = robots(vec![a, b]);
+        resolve_robot_contacts(&mut map, &field, &[], &c, &mut events);
+        let pb = map[&RobotId::new(Team::Blue, 1)].pos;
+        let pa = map[&RobotId::new(Team::Blue, 0)].pos;
+        let corner_now = pa + corner;
+        assert!(((pb - corner_now).length() - r).abs() < 1e-9);
+        // discs only when disabled
+        let disc_only = ContactParams {
+            robot_hull_chord_contacts: false,
+            ..c
+        };
+        let a = robot(0, Vec2::ZERO, 0.0);
+        let b = robot(1, Vec2::new(0.14, 0.0), PI);
+        let mut map = robots(vec![a, b]);
+        resolve_robot_contacts(&mut map, &field, &[], &disc_only, &mut events);
+        let pa = map[&RobotId::new(Team::Blue, 0)].pos;
+        let pb = map[&RobotId::new(Team::Blue, 1)].pos;
+        assert!(((pb - pa).length() - 2.0 * r).abs() < 1e-9);
+    }
+
+    #[test]
     fn robot_vs_wall_and_resting_contact_no_event() {
         let c = ContactParams::default();
         let field = FieldGeometry::default();
@@ -969,7 +1411,7 @@ mod tests {
         assert!(r.vel.y < 0.5 && r.vel.y > 0.0);
         assert!(events.is_empty());
         // two robots resting in contact, no relative velocity: no event
-        let a = robot(0, Vec2::ZERO, 0.0);
+        let a = robot(0, Vec2::ZERO, PI);
         let b = robot(1, Vec2::new(0.179, 0.0), 0.0);
         let mut map = robots(vec![a, b]);
         resolve_robot_contacts(&mut map, &field, &[], &c, &mut events);

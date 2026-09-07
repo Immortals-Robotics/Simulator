@@ -43,9 +43,15 @@ impl Ball {
         self.state.pos.z > params.radius + 1e-6 || self.state.vel.z.abs() > 1e-9
     }
 
-    /// Advance the free-flight/rolling model by `dt` (no collisions).
+    /// Advance the free-flight/rolling model by `dt` (no collisions) on the carpet.
     pub fn advance(&mut self, dt: f64, params: &BallParams) {
-        let traj = BallTrajectory::from_state(&self.state, params);
+        self.advance_on(dt, params, 0.0);
+    }
+
+    /// Advance the free-flight/rolling model by `dt` (no collisions) with the
+    /// supporting surface at height `floor_z` (a robot top).
+    pub fn advance_on(&mut self, dt: f64, params: &BallParams, floor_z: f64) {
+        let traj = BallTrajectory::from_state_on(&self.state, params, floor_z);
         self.state = traj.state_at(dt);
     }
 }

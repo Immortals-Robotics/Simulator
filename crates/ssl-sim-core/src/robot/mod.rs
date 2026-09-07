@@ -50,14 +50,17 @@ pub struct Robot {
     pub force_target: Option<Vec2>,
     /// Ball currently seated on the dribbler (break beam), updated every substep.
     pub ball_contact: bool,
+    /// This robot's dribbler holding budget [m/s^2] at full speed: drawn once
+    /// per robot from `N(hold_accel, hold_accel_stddev)` clamped to
+    /// `hold_accel_min` (`World` does the draw); defaults to the spec mean.
+    pub hold_accel_actual: f64,
 }
 
 impl Robot {
-    /// Create a robot at rest.
+    /// Create a robot at rest with the mean dribbler holding budget.
     pub fn new(id: RobotId, specs: RobotSpecs, pos: Vec2, orientation: f64) -> Self {
         Self {
             id,
-            specs,
             pos,
             orientation,
             vel: Vec2::ZERO,
@@ -69,6 +72,8 @@ impl Robot {
             dribbler: dribbler::DribblerState::default(),
             force_target: None,
             ball_contact: false,
+            hold_accel_actual: specs.dribbler.hold_accel,
+            specs,
         }
     }
 

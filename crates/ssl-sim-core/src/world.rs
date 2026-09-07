@@ -11,7 +11,7 @@ use crate::ball::Ball;
 use crate::field::{default_formation, Division, FieldGeometry, WallSegment};
 use crate::params::{Realism, RobotSpecs, SimConfig};
 use crate::physics;
-use crate::rng::Rngs;
+use crate::rng::{normal, Rngs};
 use crate::robot::Robot;
 use crate::types::{
     BallState, Event, RobotCommand, RobotId, RobotState, SimError, SimTime, Team, TeleportBall,
@@ -89,10 +89,8 @@ impl World {
                         Team::Yellow => (Vec2::new(p.x.abs(), p.y), std::f64::consts::PI),
                     };
                     let id = RobotId::new(team, number);
-                    self.robots.insert(
-                        id,
-                        Robot::new(id, self.default_specs(team), pos, orientation),
-                    );
+                    let robot = self.create_robot(id, pos, orientation);
+                    self.robots.insert(id, robot);
                 }
             }
         }
@@ -104,6 +102,21 @@ impl World {
             Team::Blue => self.config.blue_specs,
             Team::Yellow => self.config.yellow_specs,
         }
+    }
+
+    /// A new robot with the team's default specs and its own dribbler
+    /// holding budget drawn from the seeded physics stream:
+    /// `max(hold_accel + N(0, hold_accel_stddev), hold_accel_min)`.
+    fn create_robot(&mut self, id: RobotId, pos: Vec2, orientation: f64) -> Robot {
+        let specs = self.default_specs(id.team);
+        let mut robot = Robot::new(id, specs, pos, orientation);
+        robot.hold_accel_actual = Self::draw_hold_accel(&mut self.rngs, &specs);
+        robot
+    }
+
+    fn draw_hold_accel(rngs: &mut Rngs, specs: &RobotSpecs) -> f64 {
+        let d = &specs.dribbler;
+        (d.hold_accel + normal(&mut rngs.physics, d.hold_accel_stddev)).max(d.hold_accel_min)
     }
 
     // ----- accessors -----
@@ -192,6 +205,7 @@ impl World {
             &self.field,
             &self.walls,
             &self.config,
+            &mut self.rngs,
             &mut self.events,
         );
         self.time = self.time.plus(SimTime::from_secs_f64(dt));
@@ -290,11 +304,8 @@ impl World {
                     req.id
                 )));
             };
-            let specs = self.default_specs(req.id.team);
-            self.robots.insert(
-                req.id,
-                Robot::new(req.id, specs, pos, req.orientation.unwrap_or(0.0)),
-            );
+            let robot = self.create_robot(req.id, pos, req.orientation.unwrap_or(0.0));
+            self.robots.insert(req.id, robot);
         }
         let robot = self.robots.get_mut(&req.id).expect("inserted above");
         if req.by_force {
@@ -323,11 +334,15 @@ impl World {
         Ok(())
     }
 
-    /// Update specs of one robot (must exist), keeping its state.
+    /// Update specs of one robot (must exist), keeping its state. The robot's
+    /// dribbler holding draw keeps its deviation from the (possibly new) mean.
     pub fn set_robot_specs(&mut self, id: RobotId, specs: RobotSpecs) -> Result<(), SimError> {
         validate_specs(&specs)?;
         match self.robots.get_mut(&id) {
             Some(r) => {
+                let deviation = r.hold_accel_actual - r.specs.dribbler.hold_accel;
+                r.hold_accel_actual =
+                    (specs.dribbler.hold_accel + deviation).max(specs.dribbler.hold_accel_min);
                 r.specs = specs;
                 Ok(())
             }
@@ -449,5 +464,176 @@ fn validate_specs(s: &RobotSpecs) -> Result<(), SimError> {
         Ok(())
     } else {
         Err(SimError::InvalidSpec(format!("{s:?}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::params::DribblerParams;
+    use crate::types::MoveCommand;
+
+    fn seeded(seed: u64) -> World {
+        let config = SimConfig {
+            seed,
+            initial_robots_per_team: 6,
+            ..SimConfig::default()
+        };
+        World::new(config, Division::A)
+    }
+
+    /// Drive a scripted scenario: blue 0 (moved to open space) carries the
+    /// ball on its dribbler while turning, then chips it; the others wander
+    /// slowly. Returns the number of kick events seen.
+    fn scripted(world: &mut World, substeps: usize) -> usize {
+        let carrier = RobotId::new(Team::Blue, 0);
+        world
+            .teleport_robot(TeleportRobot {
+                id: carrier,
+                position: Some(Vec2::new(0.0, -3.0)),
+                orientation: Some(0.0),
+                velocity: Some(Vec2::ZERO),
+                angular_velocity: Some(0.0),
+                present: None,
+                by_force: false,
+            })
+            .unwrap();
+        let pos = world.robots()[&carrier].pos;
+        let heading = world.robots()[&carrier].heading();
+        let seat = pos + heading * world.robots()[&carrier].specs.shoot_radius;
+        world
+            .teleport_ball(TeleportBall {
+                position: Some(Vec3::new(seat.x, seat.y, 0.0)),
+                velocity: Some(Vec3::ZERO),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut kicks = 0;
+        for i in 0..substeps {
+            if i % 10 == 0 {
+                let t = i as f64 * world.config().substep;
+                for n in 0..6u8 {
+                    for team in [Team::Blue, Team::Yellow] {
+                        let id = RobotId::new(team, n);
+                        let phase = t * 0.9 + n as f64;
+                        let cmd = if id == carrier {
+                            RobotCommand {
+                                movement: Some(MoveCommand::LocalVelocity {
+                                    forward: 0.6,
+                                    left: 0.0,
+                                    angular: 0.8 * (t * 2.0).sin(),
+                                }),
+                                kick_speed: (4000..4100).contains(&i).then_some(4.0),
+                                kick_angle_deg: 45.0,
+                                dribbler_rpm: Some(10000.0),
+                            }
+                        } else {
+                            RobotCommand {
+                                movement: Some(MoveCommand::LocalVelocity {
+                                    forward: 0.5 * phase.cos(),
+                                    left: 0.4 * phase.sin(),
+                                    angular: 1.5 * (phase * 0.5).sin(),
+                                }),
+                                dribbler_rpm: Some(3000.0),
+                                ..Default::default()
+                            }
+                        };
+                        world.set_robot_command(id, cmd).unwrap();
+                    }
+                }
+            }
+            world.step();
+            kicks += world
+                .take_events()
+                .iter()
+                .filter(|e| matches!(e, Event::Kick { .. }))
+                .count();
+            world.drain_vision();
+        }
+        kicks
+    }
+
+    #[test]
+    fn same_seed_and_commands_give_identical_state_hashes() {
+        assert!(SimConfig::default().realism.kick_direction_stddev > 0.0);
+        let mut a = seeded(7);
+        let mut b = seeded(7);
+        assert_eq!(a.state_hash(), b.state_hash());
+        let ka = scripted(&mut a, 10_000);
+        let kb = scripted(&mut b, 10_000);
+        assert_eq!(ka, 1, "the scripted kick must fire");
+        assert_eq!(ka, kb);
+        assert_eq!(a.state_hash(), b.state_hash());
+        assert_eq!(a.snapshot(), b.snapshot());
+        // a different seed perturbs the (noisy) kick and the holding draws
+        let mut c = seeded(8);
+        scripted(&mut c, 10_000);
+        assert_ne!(a.state_hash(), c.state_hash());
+    }
+
+    #[test]
+    fn per_robot_hold_accel_is_drawn_clamped_and_differs_between_robots() {
+        let world = seeded(3);
+        let d = DribblerParams::default();
+        assert!(d.hold_accel_stddev > 0.0);
+        let draws: Vec<f64> = world
+            .robots()
+            .values()
+            .map(|r| r.hold_accel_actual)
+            .collect();
+        assert_eq!(draws.len(), 12);
+        assert!(draws.iter().all(|&h| h >= d.hold_accel_min));
+        let distinct = draws
+            .iter()
+            .filter(|&&h| draws.iter().filter(|&&o| (o - h).abs() < 1e-12).count() == 1)
+            .count();
+        assert!(distinct >= 10, "draws {draws:?}");
+        let mean = draws.iter().sum::<f64>() / draws.len() as f64;
+        assert!((mean - d.hold_accel).abs() < 1.0, "mean {mean}");
+        // same seed: same draws; the draws are part of the physics stream
+        let again = seeded(3);
+        let draws2: Vec<f64> = again
+            .robots()
+            .values()
+            .map(|r| r.hold_accel_actual)
+            .collect();
+        assert_eq!(draws, draws2);
+        // zero spread: everyone gets the mean; a huge spread is clamped from below
+        let mut cfg = SimConfig {
+            seed: 3,
+            initial_robots_per_team: 4,
+            ..SimConfig::default()
+        };
+        cfg.blue_specs.dribbler.hold_accel_stddev = 0.0;
+        cfg.yellow_specs.dribbler.hold_accel_stddev = 100.0;
+        cfg.yellow_specs.dribbler.hold_accel_min = 2.5;
+        let world = World::new(cfg, Division::A);
+        for r in world.robots().values() {
+            match r.id.team {
+                Team::Blue => assert_eq!(r.hold_accel_actual, d.hold_accel),
+                Team::Yellow => assert!(r.hold_accel_actual >= 2.5),
+            }
+        }
+        // a robot added later gets its own draw, and spec updates keep the deviation
+        let mut world = seeded(5);
+        let id = RobotId::new(Team::Yellow, 15);
+        world
+            .teleport_robot(TeleportRobot {
+                id,
+                position: Some(Vec2::new(3.0, 3.0)),
+                orientation: None,
+                velocity: None,
+                angular_velocity: None,
+                present: Some(true),
+                by_force: false,
+            })
+            .unwrap();
+        let drawn = world.robots()[&id].hold_accel_actual;
+        assert!(drawn >= d.hold_accel_min);
+        let mut specs = world.default_specs(Team::Yellow);
+        specs.dribbler.hold_accel = 5.0;
+        world.set_robot_specs(id, specs).unwrap();
+        let after = world.robots()[&id].hold_accel_actual;
+        assert!((after - (drawn - d.hold_accel + 5.0)).abs() < 1e-12 || after == d.hold_accel_min);
     }
 }
