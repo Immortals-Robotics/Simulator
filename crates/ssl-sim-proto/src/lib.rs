@@ -19,3 +19,8 @@ pub mod grsim {
 pub mod tracked {
     include!(concat!(env!("OUT_DIR"), "/tracked.rs"));
 }
+
+#[allow(clippy::all, missing_docs)]
+pub mod gc {
+    include!(concat!(env!("OUT_DIR"), "/gc.rs"));
+}

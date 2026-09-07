@@ -2517,6 +2517,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ssl-sim-logtool"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "flate2",
+ "prost",
+ "serde",
+ "serde_json",
+ "ssl-sim-core",
+ "ssl-sim-proto",
+]
+
+[[package]]
 name = "ssl-sim-net"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,20 @@
+[package]
+name = "ssl-sim-logtool"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Analyse recorded SSL game logs to calibrate the simulator"
+
+[[bin]]
+name = "ssl-logtool"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+flate2 = "1.0"
+prost.workspace = true
+serde.workspace = true
+serde_json = "1.0"
+ssl-sim-core = { path = "../ssl-sim-core" }
+ssl-sim-proto = { path = "../ssl-sim-proto" }

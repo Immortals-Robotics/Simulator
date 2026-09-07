@@ -55,6 +55,16 @@ fn main() -> Result<()> {
     ];
     compile("tracked", &tracked_files, &[vision_dir])?;
 
+    // Family 4: game-controller referee messages (for reading game logs).
+    let gc_dir = protocol_dir.join("ssl-game-controller");
+    let gc_files = [
+        gc_dir.join("state/ssl_gc_common.proto"),
+        gc_dir.join("geom/ssl_gc_geometry.proto"),
+        gc_dir.join("state/ssl_gc_game_event.proto"),
+        gc_dir.join("state/ssl_gc_referee_message.proto"),
+    ];
+    compile("gc", &gc_files, &[gc_dir])?;
+
     Ok(())
 }
 

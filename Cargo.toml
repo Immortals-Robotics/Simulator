@@ -5,6 +5,7 @@ members = [
     "crates/ssl-sim-net",
     "crates/ssl-sim-cli",
     "crates/ssl-sim-viewer",
+    "crates/ssl-sim-logtool",
 ]
 resolver = "2"
 
